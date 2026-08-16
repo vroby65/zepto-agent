@@ -2,7 +2,6 @@
 """Za: a small, local, learning Linux agent."""
 
 import argparse
-import base64
 import configparser
 import contextlib
 import dataclasses
@@ -21,16 +20,15 @@ import sys
 import tempfile
 import threading
 import time
-import zlib
 from pathlib import Path
 
 
 MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-LOGO_DATA = (
-    "c-rlj!EM7Z3`Or<!AppuC`$OFWQOd}DLP;$Ddiv*Wz<M>EeOL0`#+Ne`6+n2aYIHL*L}N{`SAVqxrG?wU&M6(h)#s~uZ@%|C@WZ="
-    "02PqkwVt7l(iW&fyN6_l<VeK{q#0V5T4>g?e<3J(Rcy9QnIUosumJ?=R{$lj)mp+B?~8dEMC;aVKkm_10rSynMO7mmLk&vf)scgi"
-    "9HtKgaP{-l2Jwl8*KEezJk$~-hWfVHZEdaRv)>in2Go4JZP%qk+llcjW?MzJ-JK3b(QVVxnGrPganc%x$#P|s>duw2*XI}uqtF?q"
-    "Sj=I&iHyU@3`))*zaVQdk0=xt3NijXLJaY>k$wPUNh&q"
+LOGO_TEXT = (
+    "",
+    " ▀▀█ █▀█",
+    " ▄▀  █▀█",
+    " ▀▀▀ ▀ ▀",
 )
 SCHEMA_VERSION = 2
 OUTPUT_LIMIT = 64 * 1024
@@ -53,13 +51,9 @@ ANSI_BLUE = "\033[34m"
 ANSI_MAGENTA = "\033[35m"
 ANSI_GRAY = "\033[90m"
 ANSI_RESET = "\033[0m"
-ANSI_RAINBOW = (ANSI_RED, ANSI_YELLOW, ANSI_GREEN, ANSI_CYAN, ANSI_BLUE, ANSI_MAGENTA)
-RGB_RAINBOW = ((255, 45, 45), (255, 210, 0), (45, 220, 80),
-               (0, 205, 220), (65, 105, 255), (210, 65, 255))
-ANSI_PIXEL = re.compile(
-    r"\x1b\[38;2;(\d+);(\d+);(\d+)m\x1b\[48;2;(\d+);(\d+);(\d+)m▀")
-
-
+ANSI_RAINBOW = ("\033[38;2;255;35;35m", "\033[38;2;255;225;0m",
+                "\033[38;2;0;255;85m", "\033[38;2;0;240;255m",
+                "\033[38;2;55;115;255m", "\033[38;2;255;35;220m")
 def machine_hash():
     try:
         identity = Path("/etc/machine-id").read_text(encoding="utf-8").strip()
@@ -109,75 +103,11 @@ def show_status(symbol, message, color=ANSI_CYAN):
     print(f"{terminal_style(symbol, color)}  {message}")
 
 
-def rainbow_logo_line(line):
-    if not sys.stdout.isatty():
-        return line
-    width = len(line)
-    return "".join(
-        terminal_style(char, ANSI_RAINBOW[i * len(ANSI_RAINBOW) // width])
-        if char != " " else char for i, char in enumerate(line)
-    )
-
-
-def _rainbow_rgb(column, width, brightness):
-    position = column * (len(RGB_RAINBOW) - 1) / max(width - 1, 1)
-    left = min(int(position), len(RGB_RAINBOW) - 2)
-    fraction = position - left
-    color = tuple(round(RGB_RAINBOW[left][channel] * (1 - fraction)
-                        + RGB_RAINBOW[left + 1][channel] * fraction)
-                  for channel in range(3))
-    return tuple(round(value * brightness) for value in color)
-
-
-def _rainbow_ansi_logo(text):
-    rendered = []
-    for line in text.splitlines():
-        cells = ANSI_PIXEL.findall(line)
-        if not cells:
-            continue
-        if not any(max(map(int, values)) >= 30 for values in cells):
-            continue
-        output = []
-        for column, values in enumerate(cells):
-            numbers = tuple(map(int, values))
-            foreground = _rainbow_rgb(column, len(cells), max(numbers[:3]) / 255)
-            background = _rainbow_rgb(column, len(cells), max(numbers[3:]) / 255)
-            output.append(
-                f"\033[38;2;{foreground[0]};{foreground[1]};{foreground[2]}m"
-                f"\033[48;2;{background[0]};{background[1]};{background[2]}m▀"
-            )
-        rendered.append("".join(output) + ANSI_RESET)
-    return rendered
-
-
-def _plain_ansi_logo(text):
-    rendered = []
-    for line in text.splitlines():
-        cells = ANSI_PIXEL.findall(line)
-        if not cells:
-            continue
-        if not any(max(map(int, values)) >= 30 for values in cells):
-            continue
-        output = []
-        for values in cells:
-            numbers = tuple(map(int, values))
-            upper, lower = max(numbers[:3]) >= 30, max(numbers[3:]) >= 30
-            output.append("█" if upper and lower else "▀" if upper else "▄" if lower else " ")
-        rendered.append("".join(output).rstrip())
-    return rendered
-
-
 def logo_lines():
-    try:
-        source = zlib.decompress(base64.b85decode(LOGO_DATA)).decode("utf-8")
-        lines = _rainbow_ansi_logo(source) if sys.stdout.isatty() else _plain_ansi_logo(source)
-        if lines:
-            return lines
-    except (ValueError, UnicodeError, zlib.error):
-        pass
-    fallback = ("██████  ████", "   ██  ██  ██", "  ██   ██████",
-                " ██    ██  ██", "██████ ██  ██")
-    return list(map(rainbow_logo_line, fallback))
+    return ["".join(
+        terminal_style(char, ANSI_RAINBOW[i * len(ANSI_RAINBOW) // len(line)])
+        if char != " " else char for i, char in enumerate(line)
+    ) for line in LOGO_TEXT]
 
 
 def terminal_header():
@@ -597,6 +527,41 @@ class ApplicationResolver:
         return rows[0] if rows else None
 
 
+def link_applications(database, bin_dir=None, launcher_dir=None):
+    bin_dir = Path(bin_dir or Path.home() / ".local/bin")
+    launcher_dir = Path(launcher_dir or
+                        Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+                        / "za/launchers")
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    created = skipped = 0
+    rows = database.connection.execute("""
+        SELECT name,identifier,source,launch_json FROM applications
+        WHERE source IN ('desktop','appimage','flatpak')
+        ORDER BY CASE source WHEN 'flatpak' THEN 0 WHEN 'appimage' THEN 1 ELSE 2 END,
+                 name COLLATE NOCASE
+    """)
+    for row in rows:
+        name = re.sub(r"[^a-z0-9._-]+", "-", row["name"].casefold()).strip("-.")
+        if not name:
+            name = re.sub(r"[^a-z0-9._-]+", "-", row["identifier"].casefold()).strip("-.")
+        link = bin_dir / name
+        if not name or link.exists() or link.is_symlink() or shutil.which(name):
+            skipped += 1
+            continue
+        launch = json.loads(row["launch_json"])
+        direct = Path(launch[0]) if len(launch) == 1 and Path(launch[0]).is_absolute() else None
+        if direct and direct.is_file() and os.access(direct, os.X_OK):
+            target = direct
+        else:
+            launcher_dir.mkdir(parents=True, exist_ok=True)
+            target = launcher_dir / name
+            target.write_text(f"#!/bin/sh\nexec {shlex.join(launch)} \"$@\"\n", encoding="utf-8")
+            target.chmod(0o755)
+        link.symlink_to(target)
+        created += 1
+    return {"created": created, "skipped": skipped, "bin_dir": str(bin_dir)}
+
+
 def normalize_intent(request):
     text = request.strip().casefold()
     text = re.sub(r"(?:~|/)[^\s'\"]+", "{{path}}", text)
@@ -844,7 +809,7 @@ class ModelEngine:
             show_status("◆", "Carico il modello dalla cache Za…")
         else:
             print(terminal_style("╭──────────────────────╮", ANSI_MAGENTA))
-            print(terminal_style("│  ↓  MODEL DOWNLOAD  ↓  │", ANSI_YELLOW))
+            print(terminal_style("│ ↓  MODEL DOWNLOAD  ↓ │", ANSI_YELLOW))
             print(terminal_style("╰──────────────────────╯", ANSI_BLUE))
             show_status("◆", f"Scarico {MODEL}…", ANSI_GREEN)
             show_status("→", str(self.config.model_cache), ANSI_CYAN)
@@ -1537,17 +1502,18 @@ def run_self_tests():
             self.assertEqual((versions[-1]["generated_code"], versions[-1]["approved_code"]),
                              ("echo old", "echo changed"))
 
-        def test_21_logo_uses_out_txt_and_keeps_rainbow(self):
-            source = zlib.decompress(base64.b85decode(LOGO_DATA)).decode("utf-8")
+        def test_21_logo_uses_uppercase_pagga_font_and_rainbow(self):
             with patch("sys.stdout.isatty", return_value=False):
                 plain = logo_lines()
             with patch("sys.stdout.isatty", return_value=True):
                 colored = logo_lines()
-            self.assertTrue(source.startswith("\033[38;2;"))
-            self.assertTrue(any("█" in line or "▄" in line for line in plain))
-            self.assertTrue(all(line for line in plain))
-            self.assertTrue(any("\033[38;2;" in line for line in colored))
-            self.assertNotEqual(colored[0], source.splitlines()[1])
+            self.assertEqual(plain, list(LOGO_TEXT))
+            self.assertEqual(len(plain), 4)
+            self.assertEqual(plain[0], "")
+            self.assertTrue(all(line.startswith(" ") for line in plain[1:]))
+            self.assertEqual(plain[-1], " ▀▀▀ ▀ ▀")
+            self.assertTrue(any(color in "".join(colored) for color in ANSI_RAINBOW))
+            self.assertNotEqual(colored, plain)
 
         def test_22_partial_model_cache_is_resumed_online(self):
             snapshot = (self.config.model_cache
@@ -1555,6 +1521,32 @@ def run_self_tests():
             snapshot.mkdir(parents=True)
             (snapshot / "config.json").write_text("{}")
             self.assertFalse(ModelEngine(self.config).cache_present())
+
+        def test_23_link_apps_creates_symlinks_without_overwriting(self):
+            app = self.root / "Editor.AppImage"
+            app.write_text("#!/bin/sh\n", encoding="utf-8"); app.chmod(0o755)
+            self.db.upsert_application({"source": "appimage", "identifier": str(app),
+                                        "name": "Editor", "launch": [str(app)]})
+            self.db.upsert_application({"source": "flatpak", "identifier": "org.gimp.GIMP",
+                                        "name": "GIMP", "launch": ["flatpak", "run", "org.gimp.GIMP"]})
+            self.db.upsert_application({"source": "desktop", "identifier": "keep",
+                                        "name": "Keep", "launch": ["gtk-launch", "keep"]})
+            self.db.upsert_application({"source": "desktop", "identifier": "system-tool",
+                                        "name": "System Tool", "launch": ["gtk-launch", "system-tool"]})
+            self.db.connection.commit()
+            bin_dir = self.root / "bin"; bin_dir.mkdir()
+            existing = bin_dir / "keep"; existing.write_text("mine", encoding="utf-8")
+            system_bin = self.root / "system-bin"; system_bin.mkdir()
+            system_tool = system_bin / "system-tool"
+            system_tool.write_text("#!/bin/sh\n", encoding="utf-8"); system_tool.chmod(0o755)
+            with patch.dict(os.environ, {"PATH": str(system_bin)}):
+                result = link_applications(self.db, bin_dir, self.root / "launchers")
+            self.assertEqual((result["created"], result["skipped"]), (2, 2))
+            self.assertEqual((bin_dir / "editor").resolve(), app)
+            self.assertTrue((bin_dir / "gimp").is_symlink())
+            self.assertIn("flatpak run org.gimp.GIMP", (bin_dir / "gimp").resolve().read_text())
+            self.assertEqual(existing.read_text(encoding="utf-8"), "mine")
+            self.assertFalse((bin_dir / "system-tool").exists())
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
@@ -1566,6 +1558,8 @@ def build_parser():
     parser.add_argument("--verbose", action="store_true", help="mostra metriche diagnostiche")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--scan", action="store_true", help="aggiorna la mappa del sistema")
+    actions.add_argument("--link-apps", action="store_true",
+                         help="crea in ~/.local/bin i collegamenti alle applicazioni")
     actions.add_argument("--list-apps", action="store_true", help="elenca le applicazioni trovate")
     actions.add_argument("--find-app", metavar="QUERY", help="cerca un'applicazione")
     actions.add_argument("--list-skills", action="store_true", help="elenca le procedure apprese")
@@ -1582,6 +1576,9 @@ def build_parser():
 def command_line(agent, args):
     if args.scan:
         result = agent.scanner.scan(force=True); print(json.dumps(result, indent=2)); return
+    if args.link_apps:
+        scan = agent.scanner.scan(force=True)
+        print(json.dumps({"scan": scan, **link_applications(agent.db)}, indent=2)); return
     if args.list_apps:
         for row in agent.db.connection.execute("SELECT name,source,path FROM applications ORDER BY name COLLATE NOCASE"):
             print(f"{row['name']}\t{row['source']}\t{row['path'] or ''}")
