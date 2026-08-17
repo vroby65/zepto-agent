@@ -4,6 +4,7 @@
 import argparse
 import configparser
 import contextlib
+import curses
 import dataclasses
 import difflib
 import hashlib
@@ -18,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -51,6 +53,7 @@ ANSI_BLUE = "\033[34m"
 ANSI_MAGENTA = "\033[35m"
 ANSI_GRAY = "\033[90m"
 ANSI_RESET = "\033[0m"
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_RAINBOW = ("\033[38;2;255;35;35m", "\033[38;2;255;225;0m",
                 "\033[38;2;0;255;85m", "\033[38;2;0;240;255m",
                 "\033[38;2;55;115;255m", "\033[38;2;255;35;220m")
@@ -959,6 +962,36 @@ class Executor:
                 with contextlib.suppress(OSError):
                     Path(tmp_file).unlink()
 
+    def start(self, proposal, cwd=None):
+        if proposal.argv:
+            command = proposal.argv
+        else:
+            interpreter, _ = INTERPRETERS[proposal.language]
+            command = [interpreter, "-c", proposal.code]
+        process = subprocess.Popen(command, cwd=cwd or os.getcwd(), stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True)
+        process._za_stdout = b""
+        process._za_stderr = b""
+
+        def capture(stream, attribute):
+            while True:
+                chunk = stream.read1(4096)
+                if not chunk:
+                    break
+                current = getattr(process, attribute)
+                setattr(process, attribute, (current + chunk)[-self.output_limit:])
+            stream.close()
+
+        process._za_output_threads = [
+            threading.Thread(target=capture, args=(process.stdout, "_za_stdout"), daemon=True),
+            threading.Thread(target=capture, args=(process.stderr, "_za_stderr"), daemon=True),
+        ]
+        for thread in process._za_output_threads:
+            thread.start()
+        threading.Thread(target=process.wait, daemon=True).start()
+        return process
+
 
 class Validator:
     def validate(self, proposal, result):
@@ -1061,21 +1094,27 @@ Il codice deve essere ripetibile, usare argv/subprocess senza shell quando possi
         skill_id, version = proposal.skill_id, proposal.skill_version
         if not skill_id or approved_code != proposal.generated_code:
             skill_id, version = self.skills.create_candidate(request, proposal, approved_code)
-        result = self.executor.run(proposal)
-        semantic_ok, verification = self.validator.validate(proposal, result)
-        success = result.returncode == 0 and semantic_ok
-        self.skills.record_outcome(skill_id, version, success)
-        self.db.connection.execute("""INSERT INTO executions
+        process = self.executor.start(proposal)
+        cursor = self.db.connection.execute("""INSERT INTO executions
           (skill_id,skill_version,request,normalized_intent,generated_code,approved_code,
            parameters_json,exit_code,stdout,stderr,semantic_ok,result,model,created_at)
           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (skill_id, version, redact_sensitive(request), normalize_intent(request),
            redact_sensitive(proposal.generated_code), redact_sensitive(approved_code),
            json.dumps({"paths": request_paths(request)}, ensure_ascii=False),
-           result.returncode, redact_sensitive(result.stdout), redact_sensitive(result.stderr),
-           int(semantic_ok), verification, MODEL, time.time()))
+           None, "", "", 0, "process-started", MODEL, time.time()))
         self.db.connection.commit()
-        return result, success, verification
+        return process, cursor.lastrowid, skill_id, version
+
+    def record_feedback(self, execution_id, skill_id, version, success, exit_code=None):
+        self.skills.record_outcome(skill_id, version, success)
+        value = "success" if success else "failure"
+        self.db.connection.execute(
+            "UPDATE executions SET exit_code=?,semantic_ok=?,result=? WHERE id=?",
+            (exit_code, int(success), f"user-feedback:{value}", execution_id))
+        self.db.connection.execute("""INSERT INTO feedback(execution_id,kind,value,created_at)
+          VALUES(?,?,?,?)""", (execution_id, "execution-result", value, time.time()))
+        self.db.connection.commit()
 
 
 def show_code(proposal, code=None):
@@ -1101,6 +1140,217 @@ def show_result(result, success, verification):
         show_status("✕", f"La verifica non ha confermato il risultato ({verification}).", ANSI_RED)
 
 
+def process_output(process, channel):
+    if process.poll() is not None:
+        for thread in vars(process).get("_za_output_threads", ()):
+            thread.join(timeout=0.1)
+    value = vars(process).get(f"_za_{channel}", b"")
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+
+
+def format_output_lines(output, width):
+    clean = ANSI_ESCAPE.sub("", output or "").expandtabs(4)
+    lines = []
+    for line in clean.splitlines() or [""]:
+        lines.extend(textwrap.wrap(line, width=max(1, width), replace_whitespace=False,
+                                   drop_whitespace=False, break_long_words=True,
+                                   break_on_hyphens=False) or [""])
+    return lines
+
+
+def process_status(process):
+    exit_code = process.poll()
+    if exit_code is None:
+        return f"In esecuzione · PID {process.pid}", ANSI_CYAN
+    color = ANSI_GREEN if exit_code == 0 else ANSI_RED
+    return f"Terminato · codice {exit_code}", color
+
+
+def show_output_panels(process, stdout_open=False, stderr_open=False):
+    status, status_color = process_status(process)
+    print(f"\n{terminal_style('✦', ANSI_CYAN)}  {terminal_style('Risultato esecuzione', ANSI_BOLD)}"
+          f"  {terminal_style(status, status_color)}")
+    print(terminal_separator())
+    print(terminal_style("Output", ANSI_BOLD))
+    if stdout_open:
+        output = process_output(process, "stdout")
+        if output:
+            print(output, end="" if output.endswith("\n") else "\n")
+        else:
+            print(terminal_style("(nessun output)", ANSI_DIM))
+    print()
+    print(terminal_style("Errori", ANSI_RED, ANSI_BOLD))
+    if stderr_open:
+        error = process_output(process, "stderr")
+        if error:
+            rendered = terminal_style(error, ANSI_RED)
+            print(rendered, end="" if error.endswith("\n") else "\n")
+        else:
+            print(terminal_style("(nessun errore)", ANSI_DIM))
+    print(terminal_separator())
+
+
+def output_tab_ranges(labels=None):
+    labels = labels or {"stdout": "Output", "stderr": "Errori"}
+    ranges = []
+    start = 0
+    for channel in ("stdout", "stderr"):
+        end = start + len(labels[channel]) + 2
+        ranges.append((channel, start, end))
+        start = end + 1
+    return ranges
+
+
+def clicked_output_tab(x, y, ranges=None):
+    if y != 0:
+        return None
+    for channel, start, end in ranges or output_tab_ranges():
+        if start <= x < end:
+            return channel
+    return None
+
+
+def _screen_add(screen, y, x, text, attribute=0):
+    height, width = screen.getmaxyx()
+    if y < 0 or x < 0 or y >= height or x >= width:
+        return
+    with contextlib.suppress(curses.error):
+        screen.addnstr(y, x, text, width - x, attribute)
+
+
+def _output_tabs(screen, process):
+    with contextlib.suppress(curses.error):
+        curses.curs_set(0)
+    with contextlib.suppress(curses.error):
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    curses.mouseinterval(0)
+    screen.keypad(True)
+    screen.timeout(200)
+    active, scroll, follow = "stdout", 0, True
+
+    while True:
+        screen.erase()
+        height, width = screen.getmaxyx()
+        body_height = max(1, height - 7)
+        status, status_color = process_status(process)
+        status_attribute = (curses.color_pair(1) if status_color == ANSI_RED
+                            else curses.A_BOLD)
+        title = "ZA · Risultato esecuzione"
+        _screen_add(screen, 0, 0, title, curses.A_BOLD)
+        if len(title) + len(status) + 2 < width:
+            _screen_add(screen, 0, width - len(status), status, status_attribute)
+        _screen_add(screen, 1, 0, "─" * width, curses.A_DIM)
+
+        labels = {}
+        for channel, name in (("stdout", "Output"), ("stderr", "Errori")):
+            output = process_output(process, channel)
+            count = len(output.splitlines()) if output else 0
+            amount = "vuoto" if not count else "1 riga" if count == 1 else f"{count} righe"
+            labels[channel] = f"{name} · {amount}"
+        tabs = output_tab_ranges(labels)
+        for channel, start, _ in tabs:
+            attribute = curses.A_BOLD
+            if channel == active:
+                attribute |= curses.A_REVERSE
+            if channel == "stderr":
+                attribute |= curses.color_pair(1)
+            _screen_add(screen, 2, start, f" {labels[channel]} ", attribute)
+        _screen_add(screen, 3, 0, "─" * width, curses.A_DIM)
+
+        output = process_output(process, active)
+        if output:
+            lines = format_output_lines(output, width - 2)
+        else:
+            lines = ["(in attesa di output)" if process.poll() is None else
+                     "(nessun output)" if active == "stdout" else "(nessun errore)"]
+        max_scroll = max(0, len(lines) - body_height)
+        scroll = max_scroll if follow else min(scroll, max_scroll)
+        output_attribute = curses.color_pair(1) if active == "stderr" else 0
+        for row, line in enumerate(lines[scroll:scroll + body_height], start=4):
+            _screen_add(screen, row, 2, line, output_attribute)
+
+        _screen_add(screen, height - 3, 0, "─" * width, curses.A_DIM)
+        _screen_add(screen, height - 2, 0,
+                    "←→ cambia sezione · ↑↓ scorri · PgUp/PgDn pagina", curses.A_DIM)
+        _screen_add(screen, height - 1, 0,
+                    "Esito: [Invio/S] riuscita · [N] non riuscita · [Esc] non registrare",
+                    curses.A_BOLD)
+        screen.refresh()
+        key = screen.getch()
+
+        if key == curses.KEY_MOUSE:
+            with contextlib.suppress(curses.error):
+                _, x, y, _, state = curses.getmouse()
+                click = (getattr(curses, "BUTTON1_CLICKED", 0)
+                         | getattr(curses, "BUTTON1_PRESSED", 0))
+                if state & click:
+                    selected = clicked_output_tab(x, y - 2, tabs)
+                    if selected:
+                        active, scroll, follow = selected, 0, True
+                elif state & getattr(curses, "BUTTON4_PRESSED", 0):
+                    scroll = max(0, scroll - 3)
+                    follow = False
+                elif state & getattr(curses, "BUTTON5_PRESSED", 0):
+                    scroll = min(max_scroll, scroll + 3)
+                    follow = scroll == max_scroll
+            continue
+        if key in (ord("\n"), ord("\r"), curses.KEY_ENTER, ord("s"), ord("S"), ord("y"), ord("Y")):
+            return True
+        if key in (ord("n"), ord("N")):
+            return False
+        if key in (3, 27, ord("q"), ord("Q")):
+            return None
+        if key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("\t")):
+            active = "stderr" if active == "stdout" else "stdout"
+            scroll, follow = 0, True
+        elif key == ord("o"):
+            active, scroll, follow = "stdout", 0, True
+        elif key == ord("e"):
+            active, scroll, follow = "stderr", 0, True
+        elif key == curses.KEY_UP:
+            scroll = max(0, scroll - 1)
+            follow = False
+        elif key == curses.KEY_DOWN:
+            scroll = min(max_scroll, scroll + 1)
+            follow = scroll == max_scroll
+        elif key == curses.KEY_PPAGE:
+            scroll = max(0, scroll - body_height)
+            follow = False
+        elif key == curses.KEY_NPAGE:
+            scroll = min(max_scroll, scroll + body_height)
+            follow = scroll == max_scroll
+        elif key == curses.KEY_HOME:
+            scroll, follow = 0, False
+        elif key == curses.KEY_END:
+            scroll, follow = max_scroll, True
+
+
+def _plain_output_feedback(process):
+    show_output_panels(process, True, True)
+    while True:
+        try:
+            answer = input("Esito — [Invio/s] riuscita · [n] non riuscita: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        success = feedback_action(answer)
+        if success is not None:
+            return success
+        show_status("!", "Feedback non valido: rispondi s oppure n.", ANSI_YELLOW)
+
+
+def output_feedback(process):
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return _plain_output_feedback(process)
+    try:
+        return curses.wrapper(_output_tabs, process)
+    except curses.error:
+        return _plain_output_feedback(process)
+
+
 def edit_code(language, code):
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
     suffix = INTERPRETERS[language][1]
@@ -1118,6 +1368,15 @@ def edit_code(language, code):
 def confirmation_action(answer):
     return {"": "execute", "y": "execute", "e": "edit", "n": "cancel"}.get(
         answer.strip().lower(), "invalid")
+
+
+def feedback_action(answer):
+    normalized = answer.strip().casefold()
+    if normalized in {"", "s", "si", "sì", "y", "yes"}:
+        return True
+    if normalized in {"n", "no"}:
+        return False
+    return None
 
 
 # Compatibility helpers retained for callers of the original single-file API.
@@ -1261,9 +1520,19 @@ def interactive(agent):
             if action == "cancel":
                 show_status("—", "Esecuzione annullata: nulla è stato avviato.", ANSI_DIM)
                 break
-            show_status("▶", "Eseguo esclusivamente il codice approvato…", ANSI_MAGENTA)
-            result, success, verification = agent.execute_approved(request, proposal, proposal.code)
-            show_result(result, success, verification)
+            show_status("▶", "Avvio in background esclusivamente il codice approvato…", ANSI_MAGENTA)
+            process, execution_id, skill_id, version = agent.execute_approved(
+                request, proposal, proposal.code)
+            show_status("✓", f"Script avviato in background (&), PID {process.pid}.", ANSI_GREEN)
+            success = output_feedback(process)
+            if success is None:
+                show_status("!", "Feedback non registrato.", ANSI_YELLOW)
+                break
+            agent.record_feedback(execution_id, skill_id, version, success, process.poll())
+            if success:
+                show_status("✓", "Feedback registrato: procedura riuscita.", ANSI_GREEN)
+            else:
+                show_status("✕", "Feedback registrato: procedura non riuscita.", ANSI_RED)
             break
         print(f"\n{terminal_separator()}\n")
 
@@ -1493,14 +1762,24 @@ def run_self_tests():
             store.record_outcome(skill_id, version, True)
             reused = store.proposal_from_skill("say it", store.retrieve("say it")[0][0])
             agent = ZaAgent(self.config, database=self.db, engine=Mock())
-            result, success, _ = agent.execute_approved("say it", reused, "echo changed")
-            self.assertTrue(success); self.assertEqual(result.stdout, "changed\n")
+            agent.executor.start = Mock(return_value=Mock(pid=1234))
+            _, execution_id, new_skill_id, new_version = agent.execute_approved(
+                "say it", reused, "echo changed")
+            agent.record_feedback(execution_id, new_skill_id, new_version, True)
             versions = self.db.connection.execute(
                 "SELECT generated_code,approved_code FROM skill_versions WHERE skill_id=? ORDER BY version",
                 (skill_id,)).fetchall()
             self.assertEqual(len(versions), 2)
             self.assertEqual((versions[-1]["generated_code"], versions[-1]["approved_code"]),
                              ("echo old", "echo changed"))
+            execution = self.db.connection.execute(
+                "SELECT semantic_ok,result FROM executions WHERE id=?", (execution_id,)).fetchone()
+            feedback = self.db.connection.execute(
+                "SELECT kind,value FROM feedback WHERE execution_id=?", (execution_id,)).fetchone()
+            self.assertEqual((execution["semantic_ok"], execution["result"]),
+                             (1, "user-feedback:success"))
+            self.assertEqual((feedback["kind"], feedback["value"]),
+                             ("execution-result", "success"))
 
         def test_21_logo_uses_uppercase_pagga_font_and_rainbow(self):
             with patch("sys.stdout.isatty", return_value=False):
@@ -1547,6 +1826,85 @@ def run_self_tests():
             self.assertIn("flatpak run org.gimp.GIMP", (bin_dir / "gimp").resolve().read_text())
             self.assertEqual(existing.read_text(encoding="utf-8"), "mine")
             self.assertFalse((bin_dir / "system-tool").exists())
+
+        def test_24_script_starts_in_background(self):
+            started = time.monotonic()
+            process = Executor().start(CodeProposal("wait", "bash", "sleep 1"), cwd=self.root)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertIsNone(process.poll())
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=2)
+
+        def test_25_background_output_is_captured(self):
+            process = Mock()
+            with patch("subprocess.Popen", return_value=process) as popen, \
+                 patch("threading.Thread"):
+                Executor().start(CodeProposal("launch", "bash", "app"), cwd=self.root)
+            self.assertEqual(popen.call_args.kwargs.get("stdout"), subprocess.PIPE)
+            self.assertEqual(popen.call_args.kwargs.get("stderr"), subprocess.PIPE)
+
+        def test_25b_background_output_can_be_read(self):
+            process = Executor().start(CodeProposal(
+                "output", "bash", "printf stdout-text; printf stderr-text >&2"), cwd=self.root)
+            process.wait(timeout=2)
+            self.assertEqual(process_output(process, "stdout"), "stdout-text")
+            self.assertEqual(process_output(process, "stderr"), "stderr-text")
+
+        def test_26_interactive_records_immediate_feedback(self):
+            agent = Mock()
+            agent.scanner.scan.return_value = {"cached": True, "seconds": 0}
+            agent.propose.return_value = (CodeProposal("proposal", "bash", "sleep 10"), {})
+            process = Mock(pid=1234)
+            process._za_stdout = "standard output"
+            process._za_stderr = "standard error"
+            process.poll.return_value = None
+            agent.execute_approved.return_value = (process, 7, 8, 9)
+            output = Mock(isatty=Mock(return_value=False))
+            with patch("builtins.input", side_effect=["do it", "", "quit"]), \
+                 patch("sys.stdout", new=output), \
+                 patch(__name__ + ".output_feedback", return_value=True) as feedback:
+                interactive(agent)
+            feedback.assert_called_once_with(process)
+            agent.record_feedback.assert_called_once_with(7, 8, 9, True, None)
+
+        def test_27_stderr_panel_is_red_in_a_terminal(self):
+            process = Mock(_za_stdout="", _za_stderr="failure")
+            with patch("sys.stdout.isatty", return_value=True), patch("builtins.print") as output:
+                show_output_panels(process, False, True)
+            rendered = "\n".join(str(call.args[0]) if call.args else ""
+                                 for call in output.call_args_list)
+            self.assertIn(ANSI_RED, rendered)
+            self.assertIn("Errori", rendered)
+            self.assertIn(f"{ANSI_RED}failure", rendered)
+
+        def test_28_click_selects_the_output_tab(self):
+            tabs = output_tab_ranges()
+            self.assertEqual(clicked_output_tab(tabs[0][1], 0, tabs), "stdout")
+            self.assertEqual(clicked_output_tab(tabs[1][2] - 1, 0, tabs), "stderr")
+            self.assertIsNone(clicked_output_tab(tabs[1][2], 0, tabs))
+            self.assertIsNone(clicked_output_tab(tabs[0][1], 1, tabs))
+
+        def test_29_output_lines_strip_terminal_codes_and_wrap(self):
+            self.assertEqual(format_output_lines("\x1b[31mabcdefgh\x1b[0m", 4),
+                             ["abcd", "efgh"])
+
+        def test_30_output_status_is_explicit(self):
+            running = Mock(pid=42); running.poll.return_value = None
+            stopped = Mock(pid=42); stopped.poll.return_value = 0
+            self.assertEqual(process_status(running)[0], "In esecuzione · PID 42")
+            self.assertEqual(process_status(stopped)[0], "Terminato · codice 0")
+
+        def test_31_plain_output_uses_clear_labels(self):
+            process = Mock(_za_stdout="done", _za_stderr="")
+            process.poll.return_value = 0
+            with patch("sys.stdout.isatty", return_value=False), patch("builtins.print") as output:
+                show_output_panels(process, True, True)
+            rendered = "\n".join(str(call.args[0]) if call.args else ""
+                                 for call in output.call_args_list)
+            self.assertIn("Risultato esecuzione", rendered)
+            self.assertIn("Output", rendered)
+            self.assertIn("Errori", rendered)
+            self.assertIn("nessun errore", rendered)
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1

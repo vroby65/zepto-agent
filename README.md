@@ -39,6 +39,13 @@ session. Its existing Hugging Face cache is preserved at
 `~/.cache/za/machines/<machine-hash>/`; override the base with `--cache-dir`
 or `ZA_CACHE_DIR`, and the model cache with `ZA_MODEL_CACHE`.
 
+Approved scripts start in the background (`&`). Za captures their standard
+output and errors in a terminal view with separate `Output` and `Errori`
+sections. The view shows the process status, wraps long lines, and follows new
+output automatically. The arrow keys and mouse wheel scroll the active section;
+Enter/`s` records success, `n` records failure, and Esc returns without recording
+feedback.
+
 ## Maintenance commands
 
 ```bash
