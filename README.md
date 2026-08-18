@@ -52,6 +52,7 @@ feedback.
 ./za.py --scan
 ./za.py --list-apps
 ./za.py --find-app gimp
+./za.py --find-files report
 ./za.py --list-skills
 ./za.py --skill launch-application
 ./za.py --revoke-skill NAME
@@ -64,6 +65,13 @@ feedback.
 `--rebuild-cache` removes and rebuilds only scanner-derived data. Learned
 procedures and execution history are retained. A corrupt database is preserved
 with a timestamped `.corrupt-*.sqlite` name before a clean index is created.
+
+When a fresh proposal is needed, Za also navigates the filesystem read-only: it
+matches file and folder names against the request and hands the real existing
+paths (plus short, redacted previews of small text files) to the model, so
+proposed commands reference actual locations instead of invented ones.
+`--find-files QUERY` performs the same name search from the command line and
+prints `path<TAB>kind<TAB>size` without loading the model.
 
 ## Test
 

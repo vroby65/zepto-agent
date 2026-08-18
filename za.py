@@ -32,7 +32,7 @@ LOGO_TEXT = (
     " ▄▀  █▀█",
     " ▀▀▀ ▀ ▀",
 )
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 OUTPUT_LIMIT = 64 * 1024
 LANGUAGE_ALIASES = {
     "python": "python", "python3": "python", "bash": "bash",
@@ -51,7 +51,6 @@ ANSI_YELLOW = "\033[33m"
 ANSI_RED = "\033[31m"
 ANSI_BLUE = "\033[34m"
 ANSI_MAGENTA = "\033[35m"
-ANSI_GRAY = "\033[90m"
 ANSI_RESET = "\033[0m"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_RAINBOW = ("\033[38;2;255;35;35m", "\033[38;2;255;225;0m",
@@ -160,6 +159,7 @@ class SystemDatabase:
               id INTEGER PRIMARY KEY, source TEXT NOT NULL, identifier TEXT NOT NULL,
               name TEXT NOT NULL, path TEXT, description TEXT, launch_json TEXT NOT NULL,
               metadata_json TEXT NOT NULL DEFAULT '{}', fingerprint TEXT, updated_at REAL NOT NULL,
+              uses INTEGER NOT NULL DEFAULT 0,
               UNIQUE(source, identifier));
             CREATE INDEX IF NOT EXISTS applications_name ON applications(name COLLATE NOCASE);
             CREATE TABLE IF NOT EXISTS aliases(
@@ -206,9 +206,16 @@ class SystemDatabase:
         if row is None:
             self.connection.execute("INSERT INTO schema_info VALUES (?)", (SCHEMA_VERSION,))
         elif row[0] < SCHEMA_VERSION:
-            columns = {item[1] for item in self.connection.execute("PRAGMA table_info(skill_versions)")}
-            if "template_status" not in columns:
-                self.connection.execute("ALTER TABLE skill_versions ADD COLUMN template_status TEXT NOT NULL DEFAULT 'proposed'")
+            tables = {item[0] for item in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('skill_versions','applications')")}
+            if "skill_versions" in tables:
+                columns = {item[1] for item in self.connection.execute("PRAGMA table_info(skill_versions)")}
+                if "template_status" not in columns:
+                    self.connection.execute("ALTER TABLE skill_versions ADD COLUMN template_status TEXT NOT NULL DEFAULT 'proposed'")
+            if "applications" in tables:
+                columns = {item[1] for item in self.connection.execute("PRAGMA table_info(applications)")}
+                if "uses" not in columns:
+                    self.connection.execute("ALTER TABLE applications ADD COLUMN uses INTEGER NOT NULL DEFAULT 0")
             self.connection.execute("UPDATE schema_info SET version=?", (SCHEMA_VERSION,))
         self.fts = True
         try:
@@ -489,6 +496,84 @@ class SystemScanner:
         return found
 
 
+LAUNCH_VERB_WORDS = frozenset("apri aprire avvia avviare lancia lanciare open launch start apra aprano".split())
+LAUNCH_VERB_RE = re.compile(
+    r"^\s*(?:" + "|".join(sorted(LAUNCH_VERB_WORDS, key=len, reverse=True)) + r")\b", re.I)
+ACTION_WORDS = frozenset("modifica modificare crea creare elimina eliminare sposta spostare copia "
+                         "copiare rinomina rinominare trova trovare cerca cercare leggi leggere "
+                         "scarica scaricare installa installare rimuovi rimuovere".split())
+APP_CONNECTOR = re.compile(r"\s+(?:per|con|e|ed|o|di|del|della|dei|delle|in|su|a|ad|al|ai|da|dal|"
+                           r"che|come|verso|dopo|perche|perché)\s+", re.I)
+APP_LEADING_WORD = re.compile(r"^(?:il|lo|la|gli|le|un|uno|una)\s+", re.I)
+APP_LEADING_APO = ("l'", "l’")
+
+
+def _strip_leading_articles(text):
+    while True:
+        match = APP_LEADING_WORD.match(text)
+        if match:
+            text = text[match.end():]
+            continue
+        if text[:2] in APP_LEADING_APO:
+            text = text[2:]
+            continue
+        return text
+
+
+def _find_verb_tail(text):
+    lower = text.casefold()
+    for word in sorted(LAUNCH_VERB_WORDS, key=len, reverse=True):
+        match = re.search(rf"\b{re.escape(word)}\b", lower)
+        if match:
+            return text[match.end():]
+    return None
+
+
+def extract_launch_candidate(request):
+    """Ritorna il nome candidato di un'applicazione, o None se la richiesta non è di avvio."""
+    text = request.strip()
+    match = LAUNCH_VERB_RE.match(text)
+    candidate = text[match.end():] if match else _find_verb_tail(text)
+    if candidate is None:
+        words = re.findall(r"[A-Za-zÀ-ÿ0-9_]+", text.casefold(), re.UNICODE)
+        if ACTION_WORDS.intersection(words) or "/" in text or "~" in text or len(words) > 4:
+            return None
+        candidate = text
+    candidate = candidate.strip(" \"'“”‘’")
+    candidate = APP_CONNECTOR.split(candidate, maxsplit=1)[0]
+    candidate = _strip_leading_articles(candidate)
+    candidate = candidate.strip(" \"'“”‘’.,;:!?")
+    return candidate or None
+
+
+def has_launch_intent(request):
+    text = request.strip()
+    if LAUNCH_VERB_RE.match(text) or _find_verb_tail(text):
+        return True
+    words = re.findall(r"[A-Za-zÀ-ÿ0-9_]+", text.casefold(), re.UNICODE)
+    if ACTION_WORDS.intersection(words) or "/" in text or "~" in text:
+        return False
+    return 1 <= len(words) <= 4
+
+
+def choose_application(candidates):
+    """Sceglie tra più applicazioni simili; in un terminale interattivo chiede all'utente."""
+    if len(candidates) < 2 or not sys.stdin.isatty():
+        return candidates[0]
+    print("\nPiù applicazioni corrispondono alla richiesta:")
+    for index, row in enumerate(candidates[:5], start=1):
+        description = (row.get("description") or "").strip()
+        suffix = f" — {description}" if description else ""
+        print(f"  {index}) {row['name']}  [{row['source']}]{suffix}")
+    try:
+        answer = input("\nScegli un numero (Invio = prima): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return candidates[0]
+    if answer.isdigit() and 1 <= int(answer) <= min(len(candidates), 5):
+        return candidates[int(answer) - 1]
+    return candidates[0]
+
+
 class ApplicationResolver:
     def __init__(self, database):
         self.db = database
@@ -498,36 +583,123 @@ class ApplicationResolver:
 
     def search(self, query, limit=10):
         query = query.strip()
-        exact = self._rows("SELECT * FROM applications WHERE name=? COLLATE NOCASE OR identifier=? COLLATE NOCASE LIMIT ?",
-                           (query, query, limit))
+        key = query.casefold()
+        if not key:
+            return []
+        exact = self._rows("""SELECT * FROM applications WHERE name=? COLLATE NOCASE
+          OR identifier=? COLLATE NOCASE
+          OR EXISTS(SELECT 1 FROM aliases x
+                    WHERE x.application_id=applications.id AND x.alias=? COLLATE NOCASE)
+          ORDER BY uses DESC LIMIT ?""", (key, key, key, limit))
         if exact:
+            for row in exact:
+                row["score"] = 1000
             return exact
-        alias = self._rows("""SELECT a.* FROM aliases l JOIN applications a ON a.id=l.application_id
-                              WHERE l.alias=? COLLATE NOCASE LIMIT ?""", (query, limit))
-        if alias:
-            return alias
+        return self._ranked(query, key, limit)
+
+    def _ranked(self, query, key, limit):
+        scored, seen = [], set()
         if self.db.fts:
-            safe = " ".join(re.findall(r"[\w.-]+", query, re.UNICODE))
+            safe = " ".join(re.findall(r"[\w.-]+", key, re.UNICODE))
             if safe:
                 try:
-                    rows = self._rows("""SELECT a.* FROM applications_fts f JOIN applications a ON a.id=f.app_id
-                                         WHERE applications_fts MATCH ? ORDER BY rank LIMIT ?""",
-                                      (safe, limit))
-                    if rows:
-                        return rows
+                    for row in self._rows("""SELECT a.* FROM applications_fts f JOIN applications a ON a.id=f.app_id
+                                             WHERE applications_fts MATCH ? LIMIT ?""",
+                                          (safe, max(limit * 4, 20))):
+                        row["score"] = self._score(row, key)
+                        if row["score"] > 0:
+                            scored.append(row)
                 except sqlite3.OperationalError:
                     pass
-        like = f"%{query}%"
-        return self._rows("SELECT * FROM applications WHERE name LIKE ? OR description LIKE ? LIMIT ?",
-                          (like, like, limit))
+        like = f"%{key}%"
+        for row in self._rows("""SELECT * FROM applications WHERE name LIKE ? OR description LIKE ?
+                                 ORDER BY uses DESC LIMIT ?""", (like, like, max(limit * 4, 20))):
+            row["score"] = self._score(row, key)
+            if row["score"] > 0:
+                scored.append(row)
+        unique = []
+        for row in scored:
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+            unique.append(row)
+        unique.sort(key=lambda row: (-row["score"], -int(row.get("uses") or 0),
+                                     (row["name"] or "").casefold()))
+        if not unique and len(key) >= 3:
+            unique = self._fuzzy_fallback(key, limit)
+        if not unique:
+            path = shutil.which(query)
+            if path:
+                unique = [{"id": None, "source": "native", "identifier": query, "name": query,
+                           "path": path, "description": "Eseguibile disponibile in PATH",
+                           "launch_json": json.dumps([path]), "metadata_json": "{}",
+                           "fingerprint": "", "updated_at": time.time(), "uses": 0, "score": 500}]
+        return unique[:limit]
+
+    def _score(self, row, key):
+        name = (row.get("name") or "").casefold()
+        identifier = (row.get("identifier") or "").casefold()
+        description = (row.get("description") or "").casefold()
+        if name == key or identifier == key:
+            return 1000
+        words = set(re.findall(r"[\w]+", key, re.UNICODE))
+        name_words = set(re.findall(r"[\w]+", name, re.UNICODE))
+        if name.startswith(key) or identifier.startswith(key):
+            score = 700
+        elif key in name or key in description:
+            score = 450
+        else:
+            score = 0
+        if words and name_words:
+            score += 300 * (len(words & name_words) / len(name_words))
+        if words:
+            desc_words = set(re.findall(r"[\w]+", description, re.UNICODE))
+            if desc_words:
+                score += 120 * (len(words & desc_words) / len(words))
+        if words and 2 <= len(key) <= 24:
+            ratio = difflib.SequenceMatcher(None, key, name).ratio()
+            if ratio >= 0.7:
+                score += 250 * ratio
+        score += min(int(row.get("uses") or 0), 50)
+        return score
+
+    def _fuzzy_fallback(self, key, limit):
+        rows = self._rows("""SELECT id,name,source,identifier,description,path,launch_json,
+                             metadata_json,fingerprint,updated_at,uses FROM applications""", ())
+        if len(rows) > 20000:
+            return []
+        names = [(row["name"] or "").casefold() for row in rows]
+        matches = difflib.get_close_matches(key, names, n=limit, cutoff=0.65)
+        by_name = {}
+        for row in rows:
+            by_name.setdefault((row["name"] or "").casefold(), row)
+        result = []
+        for name in matches:
+            row = dict(by_name.get(name, {}))
+            if not row:
+                continue
+            row["score"] = int(difflib.SequenceMatcher(None, key, name).ratio() * 600)
+            result.append(row)
+        result.sort(key=lambda row: -row["score"])
+        return result
 
     def resolve_request(self, request):
-        match = re.match(r"(?i)^\s*(?:apri|avvia|lancia|open|launch|start)\s+(.+?)\s*$", request)
-        if not match:
+        candidate = extract_launch_candidate(request)
+        if not candidate:
             return None
-        wanted = match.group(1).strip(" '\"")
-        rows = self.search(wanted, 3)
-        return rows[0] if rows else None
+        rows = self.search(candidate, 5)
+        if not rows:
+            return None
+        return self._pick(rows)
+
+    def _pick(self, rows):
+        if len(rows) == 1:
+            return rows[0]
+        scores = [row.get("score", 0) for row in rows]
+        top, second = scores[0], scores[1]
+        if top - second >= 150 or top < 300:
+            return rows[0]
+        return choose_application(rows)
 
 
 def link_applications(database, bin_dir=None, launcher_dir=None):
@@ -593,13 +765,163 @@ def generalize_code(language, code):
         argv = shlex.split(code)
     except ValueError:
         return None
-    if len(argv) == 3 and Path(argv[0]).name in {"cp", "mv"}:
-        return [argv[0], "{{source}}", "{{destination}}"]
-    return None
+    if not argv:
+        return None
+    path_indices = [i for i, word in enumerate(argv[1:], start=1)
+                    if word.startswith("/") or word.startswith("~")]
+    if not path_indices:
+        return None
+    template = list(argv)
+    for position, index in enumerate(path_indices, start=1):
+        template[index] = f"{{{{arg{position}}}}}"
+    return template
 
 
 def request_paths(request):
     return re.findall(r"(?:~|/)[^\s'\"]+", request)
+
+
+class FilesystemNavigator:
+    """Esplora il filesystem in sola lettura per trovare percorsi utili alla richiesta."""
+
+    MAX_DEPTH = 3
+    MAX_RESULTS = 40
+    PREVIEW_LIMIT = 3
+    PREVIEW_SIZE = 2048
+    MAX_FILE_SIZE = 16 * 1024
+    TEXT_EXTENSIONS = frozenset({
+        ".py", ".sh", ".fish", ".bash", ".txt", ".md", ".rst", ".json", ".toml", ".ini",
+        ".cfg", ".yaml", ".yml", ".csv", ".tsv", ".html", ".css", ".js", ".ts", ".xml",
+        ".conf", ".env", ".properties", ".sql", ".c", ".h", ".cpp", ".hpp", ".java",
+        ".go", ".rs", ".rb", ".php", ".lua", ".log"})
+    EXTENSION_WORDS = frozenset(ext.lstrip(".") for ext in TEXT_EXTENSIONS)
+    NOISE_DIRS = frozenset({"node_modules", "site-packages", "venv", "dist", "build",
+                            "target", "vendor"})
+    USER_DIRS = ("Documenti", "Scaricati", "Scrivania", "Desktop",
+                 "Documents", "Downloads")
+    STOPWORDS = frozenset((
+        "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "del", "della",
+        "dei", "degli", "delle", "e", "ed", "o", "ad", "da", "in", "con", "su", "per",
+        "tra", "fra", "che", "come", "quale", "quali", "questo", "questa", "questi",
+        "queste", "mi", "ti", "si", "ci", "vi", "nel", "nello", "nella", "nei", "nelle",
+        "sul", "sulla", "sui", "al", "ai", "alle", "dal", "dai", "dagli", "dalle", "de",
+        "the", "a", "an", "and", "of", "to", "for", "on", "with", "my", "your", "it",
+        "is", "are", "at", "or", "from", "by", "apri", "aprire", "avvia", "avviare",
+        "trova", "trovare", "mostra", "mostrare", "cerca", "cercare", "modifica",
+        "modificare", "crea", "creare", "elimina", "eliminare", "metti", "mettere",
+        "sposta", "spostare", "rinomina", "rinominare", "leggi", "leggere", "usa",
+        "usare", "fai", "fa", "fare", "file", "files", "folder", "folders", "cartella",
+        "cartelle", "directory", "percorso", "percorsi", "contenuto", "contenuti",
+        "righe", "riga", "qualche", "anche"))
+
+    def __init__(self, roots=None):
+        self.roots = roots
+
+    def _keywords(self, text):
+        words = set()
+        for path in request_paths(text):
+            name = Path(path).name
+            words.add(name.casefold())
+            words.add(name.rsplit(".", 1)[0].casefold())
+        for token in re.findall(r"[A-Za-zÀ-ÿ0-9_]+", text, re.UNICODE):
+            token = token.strip("_")
+            if (len(token) >= 3 and token.casefold() not in self.STOPWORDS
+                    and token.casefold() not in self.EXTENSION_WORDS):
+                words.add(token.casefold())
+        if not words:
+            cleaned = re.sub(r"[^A-Za-zÀ-ÿ0-9_]+", " ", text.casefold()).strip()
+            if cleaned:
+                words.add(cleaned)
+        return words
+
+    def _candidate_roots(self, request):
+        if self.roots is not None:
+            return list(self.roots)
+        roots = []
+        for path in request_paths(request):
+            expanded = Path(os.path.expanduser(path))
+            if expanded.exists():
+                roots.append(expanded if expanded.is_dir() else expanded.parent)
+        roots.append(Path(os.getcwd()))
+        home = Path.home()
+        roots.append(home)
+        roots.extend(home / name for name in self.USER_DIRS)
+        seen, unique = set(), []
+        for root in roots:
+            key = os.path.normcase(os.path.abspath(str(root)))
+            if key not in seen:
+                seen.add(key)
+                unique.append(root)
+        return unique
+
+    def _walk(self, root, keywords, depth, results, previews):
+        if len(results) >= self.MAX_RESULTS:
+            return
+        try:
+            entries = os.scandir(root)
+        except OSError:
+            return
+        with entries:
+            for entry in entries:
+                if len(results) >= self.MAX_RESULTS:
+                    return
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    is_file = entry.is_file(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_dir:
+                    if entry.name in self.NOISE_DIRS:
+                        continue
+                    if any(keyword in entry.name.casefold() for keyword in keywords):
+                        results.append({"path": entry.path, "kind": "dir", "size": 0})
+                    if depth < self.MAX_DEPTH:
+                        self._walk(entry.path, keywords, depth + 1, results, previews)
+                elif is_file:
+                    if not any(keyword in entry.name.casefold() for keyword in keywords):
+                        continue
+                    try:
+                        size = entry.stat().st_size
+                    except OSError:
+                        continue
+                    results.append({"path": entry.path, "kind": "file", "size": size})
+                    if (len(previews) < self.PREVIEW_LIMIT
+                            and Path(entry.name).suffix.casefold() in self.TEXT_EXTENSIONS
+                            and size <= self.MAX_FILE_SIZE):
+                        preview = self._preview(entry.path)
+                        if preview:
+                            previews.append(preview)
+
+    def _preview(self, path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read(self.PREVIEW_SIZE)
+        except OSError:
+            return None
+        return {"path": path, "text": redact_sensitive(text)}
+
+    def find(self, request):
+        started = time.monotonic()
+        keywords = self._keywords(request)
+        results, previews = [], []
+        if keywords:
+            for root in self._candidate_roots(request):
+                self._walk(root, keywords, 0, results, previews)
+                if len(results) >= self.MAX_RESULTS:
+                    break
+        results.sort(key=lambda item: item["path"].casefold())
+        return {"paths": results[:self.MAX_RESULTS],
+                "previews": previews[:self.PREVIEW_LIMIT],
+                "seconds": time.monotonic() - started}
+
+    def describe(self, paths, previews):
+        block = "\n".join(f"{item['kind']}  {item['path']}  ({item['size']} B)"
+                          for item in paths)
+        for preview in previews:
+            block += f"\n--- {preview['path']} ---\n{preview['text']}"
+        return block
 
 
 @dataclasses.dataclass
@@ -614,6 +936,7 @@ class CodeProposal:
     skill_version: int | None = None
     generated_code: str = ""
     argv: list | None = None
+    app_id: int | None = None
 
 
 class SkillStore:
@@ -718,22 +1041,70 @@ class SkillStore:
                       JOIN skills s ON s.id=f.skill_id JOIN skill_versions v
                       ON v.skill_id=s.id AND v.version=s.current_version WHERE skills_fts MATCH ?
                       AND s.status IN ('verified','trusted') ORDER BY rank LIMIT ?""", (safe, limit)).fetchall()
+        if not rows:
+            words = [word for word in re.findall(r"[A-Za-zÀ-ÿ0-9_]+", intent, re.UNICODE) if len(word) > 2]
+            if words:
+                candidates = []
+                for row in self.db.connection.execute("""SELECT s.*,v.request,v.approved_code,v.language,
+                  v.template_json,v.template_status,v.verification,v.version AS version FROM skills s
+                  JOIN skill_versions v ON v.skill_id=s.id AND v.version=s.current_version
+                  WHERE s.status IN ('verified','trusted')""").fetchall():
+                    row = dict(row)
+                    blob = " ".join((row.get("request") or "", row.get("name") or "",
+                                     row.get("description") or "", row.get("intents_json") or "",
+                                     row.get("examples_json") or "")).casefold()
+                    matched = sum(1 for word in words if word in blob)
+                    if matched:
+                        row["_overlap"] = matched
+                        candidates.append(row)
+                if candidates:
+                    candidates.sort(key=lambda row: (-row["_overlap"], -row["successes"]))
+                    rows = candidates[:limit]
         return [dict(row) for row in rows], time.monotonic() - started
 
     def proposal_from_skill(self, request, skill):
         code = skill["approved_code"]
-        if skill.get("template_json") and skill.get("template_status") == "verified":
-            template, paths = json.loads(skill["template_json"]), request_paths(request)
-            if len(paths) < 2:
+        template = skill.get("template_json")
+        if template and skill.get("template_status") == "verified":
+            template = json.loads(template)
+            paths = request_paths(request)
+            placeholders = sorted(item for item in template
+                                  if item.startswith("{{") and item.endswith("}}"))
+            if len(paths) < len(placeholders):
                 return None
-            argv = [paths[0] if item == "{{source}}" else paths[1]
-                    if item == "{{destination}}" else item for item in template]
+            mapping = {name: paths[index] for index, name in enumerate(placeholders)}
+            argv = [mapping.get(item, item) for item in template]
             code = shlex.join(argv)
-        elif request.strip().casefold() != skill["request"].strip().casefold():
+        elif not self._reusable_for(skill, request):
             return None
         return CodeProposal("Carico una procedura già verificata.", skill["language"], code,
                             skill["verification"], skill["risk"], "skill", skill["id"],
                             skill["version"], code)
+
+    def _reusable_for(self, skill, request):
+        """Riusa una skill solo se la richiesta coincide, oppure se entrambe sono di avvio
+        e il codice è un avvio semplice: così le riformulazioni non cambiano il compito."""
+        stored_request = skill.get("request") or ""
+        if normalize_intent(request) == normalize_intent(stored_request):
+            return request_paths(request) == request_paths(stored_request)
+        if not (has_launch_intent(request) and has_launch_intent(stored_request)):
+            return False
+        if not self._simple_launch(skill.get("approved_code") or ""):
+            return False
+        tokens = lambda text: set(re.findall(r"[A-Za-zÀ-ÿ0-9_]+", text, re.UNICODE))
+        return bool((tokens(request) - LAUNCH_VERB_WORDS) & (tokens(stored_request) - LAUNCH_VERB_WORDS))
+
+    @staticmethod
+    def _simple_launch(code):
+        if not code or "\n" in code or any(char in code for char in "|&;><$"):
+            return False
+        try:
+            argv = shlex.split(code)
+        except ValueError:
+            return False
+        if not argv:
+            return False
+        return not any(word.startswith("/") or word.startswith("~") for word in argv[1:])
 
     def record_outcome(self, skill_id, version, success):
         if not skill_id:
@@ -808,9 +1179,7 @@ class ModelEngine:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         cached = self.cache_present()
-        if cached:
-            show_status("◆", "Carico il modello dalla cache Za…")
-        else:
+        if not cached:
             print(terminal_style("╭──────────────────────╮", ANSI_MAGENTA))
             print(terminal_style("│ ↓  MODEL DOWNLOAD  ↓ │", ANSI_YELLOW))
             print(terminal_style("╰──────────────────────╯", ANSI_BLUE))
@@ -857,15 +1226,11 @@ class ModelEngine:
 
         worker = threading.Thread(target=work)
         worker.start()
-        if sys.stdout.isatty():
-            print(terminal_style("╭─ sto elaborando", ANSI_GRAY))
         for chunk in streamer:
             if first_token[0] is None:
                 first_token[0] = time.monotonic()
             chunks.append(chunk)
         worker.join()
-        if sys.stdout.isatty():
-            print(terminal_style("\n╰─ proposta pronta", ANSI_GRAY))
         if errors:
             raise errors[0]
         elapsed = time.monotonic() - started
@@ -1025,6 +1390,7 @@ class ZaAgent:
         self.resolver = ApplicationResolver(self.db)
         self.skills = SkillStore(self.db)
         self.skills.ensure_builtins()
+        self.navigator = FilesystemNavigator()
         self.engine = engine or ModelEngine(config)
         self.executor, self.validator = Executor(config.timeout), Validator()
         self._import_legacy_history()
@@ -1068,23 +1434,36 @@ class ZaAgent:
             code = shlex.join(argv)
             return CodeProposal(f"Avvierò {app['name']} usando il metodo registrato dal sistema.",
                                 "bash", code, "process-started", "normal", "resolver",
-                                generated_code=code, argv=argv), {"skill_search_seconds": search_seconds}
+                                generated_code=code, argv=argv, app_id=app.get("id")), {"skill_search_seconds": search_seconds}
         show_status("✦", "Non ho una procedura verificata: preparo una nuova proposta…", ANSI_MAGENTA)
-        related_apps = self.resolver.search(" ".join(re.findall(r"[\w.-]+", request)[-3:]), 3)
+        related_apps = self.resolver.search(request, 3)
         context = self.system_context(related_apps, self.skills.relevant_descriptions(request))
+        fs_started = time.monotonic()
+        findings = self.navigator.find(request)
+        filesystem_seconds = time.monotonic() - fs_started
+        filesystem_block = self.navigator.describe(findings["paths"], findings["previews"])
+        if findings["paths"]:
+            show_status("⌂", f"Ho trovato {len(findings['paths'])} percorsi reali rilevanti.", ANSI_CYAN)
         system = """Sei Za, un micro-agente Linux locale specializzato esclusivamente in operazioni
 su file, directory, filesystem, dispositivi montati e spazio disco. Rispondi nella lingua dell'utente.
 Spiega brevemente cosa hai capito e cosa proponi. Non inventare percorsi, applicazioni o comandi:
-usa solo richiesta e contesto forniti. Non eseguire nulla. Restituisci esclusivamente JSON valido:
+usa solo richiesta e contesto forniti. I percorsi elencati in 'Percorsi reali rilevanti' esistono davvero
+sul filesystem: usali come sono, senza inventarne o crearne di nuovi. Non eseguire nulla.
+Restituisci esclusivamente JSON valido:
 {"explanation":"...","language":"python|bash|fish","code":"...","verification":"...","risk":"normal|high"}.
 Il codice deve essere ripetibile, usare argv/subprocess senza shell quando possibile e comunicare errori utili."""
-        user = f"Contesto macchina pertinente:\n{json.dumps(context, ensure_ascii=False)}\n\nRichiesta: {request}"
+        user = f"Contesto macchina pertinente:\n{json.dumps(context, ensure_ascii=False)}"
+        if filesystem_block:
+            user += f"\n\nPercorsi reali rilevanti:\n{filesystem_block}"
+        user += f"\n\nRichiesta: {request}"
         raw = self.engine.generate([{"role": "system", "content": system},
                                     {"role": "user", "content": user}])
         proposal = parse_model_output(raw)
         if proposal:
             proposal.generated_code = proposal.code
-        return proposal, {"skill_search_seconds": search_seconds, **self.engine.last_metrics}
+        return proposal, {"skill_search_seconds": search_seconds,
+                          "filesystem_seconds": filesystem_seconds,
+                          **self.engine.last_metrics}
 
     def execute_approved(self, request, proposal, approved_code):
         proposal.code = approved_code
@@ -1095,6 +1474,8 @@ Il codice deve essere ripetibile, usare argv/subprocess senza shell quando possi
         if not skill_id or approved_code != proposal.generated_code:
             skill_id, version = self.skills.create_candidate(request, proposal, approved_code)
         process = self.executor.start(proposal)
+        if proposal.app_id:
+            self.db.connection.execute("UPDATE applications SET uses=uses+1 WHERE id=?", (proposal.app_id,))
         cursor = self.db.connection.execute("""INSERT INTO executions
           (skill_id,skill_version,request,normalized_intent,generated_code,approved_code,
            parameters_json,exit_code,stdout,stderr,semantic_ok,result,model,created_at)
@@ -1465,18 +1846,70 @@ def recall_success(commands, user_request):
     return None
 
 
+def _history_path():
+    return (Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+            / "za" / "history.txt")
+
+
+def _terminal_input(agent):
+    """Ritorna una funzione di input stile fish: autosuggestione inline dalla cronologia
+    (accettabile con →) e completamento con Tab delle applicazioni conosciute.
+    La cronologia è persistita su file e riusata tra le sessioni.
+    Fuori da un terminale, o se prompt_toolkit non è disponibile, ripiega sul normale input()."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return input
+    try:
+        from prompt_toolkit import prompt as pt_prompt
+        from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+        from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.formatted_text import ANSI
+        from prompt_toolkit.history import FileHistory
+        from prompt_toolkit.shortcuts import CompleteStyle
+    except ImportError:
+        return input
+
+    _history_path().parent.mkdir(parents=True, exist_ok=True)
+    history = FileHistory(str(_history_path()))
+
+    class ZaCompleter(Completer):
+        def __init__(self, resolver):
+            self.resolver = resolver
+
+        def get_completions(self, document, complete_event):
+            word = document.get_word_before_cursor()
+            if not word:
+                return
+            seen = set()
+            for row in self.resolver.search(word, 8):
+                name = row.get("name") or ""
+                if name and name.casefold() not in seen:
+                    seen.add(name.casefold())
+                    yield Completion(name, start_position=-len(word))
+
+    def ask(prompt_text):
+        clean = prompt_text.replace("\001", "").replace("\002", "")
+        return pt_prompt(ANSI(clean), history=history,
+                         auto_suggest=AutoSuggestFromHistory(),
+                         completer=ZaCompleter(agent.resolver),
+                         complete_style=CompleteStyle.MULTI_COLUMN,
+                         complete_while_typing=False)
+
+    return ask
+
+
 def interactive(agent):
     print(terminal_header())
-    print(terminal_style("Scrivi una richiesta · ↑/Ctrl-R cronologia · exit/quit per uscire", ANSI_DIM))
+    print(terminal_style("Scrivi una richiesta · ↑/Ctrl-R cronologia · Tab completa · → suggerimento · exit/quit per uscire", ANSI_DIM))
     print(terminal_separator())
     readline.set_auto_history(True)
+    ask = _terminal_input(agent)
     show_status("⌁", "Aggiorno rapidamente la mappa delle applicazioni…", ANSI_CYAN)
     scan = agent.scanner.scan()
     if not scan["cached"]:
         show_status("✓", f"Mappa aggiornata in {scan['seconds']:.2f}s.", ANSI_GREEN)
     while True:
         try:
-            request = input(terminal_prompt()).strip()
+            request = ask(terminal_prompt()).strip()
         except EOFError:
             print()
             return
@@ -1538,6 +1971,7 @@ def interactive(agent):
 
 
 def run_self_tests():
+    import builtins
     import unittest
     import types
     from unittest.mock import Mock, patch
@@ -1906,6 +2340,191 @@ def run_self_tests():
             self.assertIn("Errori", rendered)
             self.assertIn("nessun errore", rendered)
 
+        def test_32_filesystem_name_match(self):
+            (self.root / "nota_importante.txt").write_text("costi 2026", encoding="utf-8")
+            (self.root / "nota_spese.txt").write_text("spese 2026", encoding="utf-8")
+            (self.root / "report_finale.md").write_text("report", encoding="utf-8")
+            navigator = FilesystemNavigator(roots=[self.root])
+            findings = navigator.find("trova la nota sui costi")
+            names = {Path(item["path"]).name for item in findings["paths"]}
+            self.assertEqual(names, {"nota_importante.txt", "nota_spese.txt"})
+            self.assertTrue(all(item["kind"] == "file" and "size" in item
+                                for item in findings["paths"]))
+            self.assertEqual({Path(item["path"]).name for item in findings["previews"]},
+                             {"nota_importante.txt", "nota_spese.txt"})
+
+        def test_33_skip_noise_and_hidden(self):
+            (self.root / "utile.txt").write_text("top", encoding="utf-8")
+            (self.root / "node_modules").mkdir()
+            (self.root / "node_modules" / "utile.txt").write_text("noise", encoding="utf-8")
+            (self.root / ".git").mkdir()
+            (self.root / ".git" / "utile.txt").write_text("hidden", encoding="utf-8")
+            findings = FilesystemNavigator(roots=[self.root]).find("utile")
+            self.assertEqual({Path(item["path"]).name for item in findings["paths"]},
+                             {"utile.txt"})
+
+        def test_34_bounded_results(self):
+            for number in range(50):
+                (self.root / f"match_{number:02d}.txt").write_text("x", encoding="utf-8")
+            findings = FilesystemNavigator(roots=[self.root]).find("match")
+            self.assertEqual(len(findings["paths"]), FilesystemNavigator.MAX_RESULTS)
+            self.assertEqual(len(findings["paths"]), 40)
+
+        def test_35_preview_only_small_text(self):
+            (self.root / "appunti.txt").write_text(
+                "inizio\npassword=hunter2\nfine", encoding="utf-8")
+            (self.root / "grossi_dati.bin").write_bytes(
+                b"\x00" * (FilesystemNavigator.MAX_FILE_SIZE + 1))
+            (self.root / "foto.png").write_bytes(b"\x89PNG\r\n\x1a\nbinary")
+            findings = FilesystemNavigator(roots=[self.root]).find("appunti password dati foto")
+            names = {Path(item["path"]).name for item in findings["paths"]}
+            self.assertEqual(names, {"appunti.txt", "grossi_dati.bin", "foto.png"})
+            self.assertEqual([Path(item["path"]).name for item in findings["previews"]],
+                             ["appunti.txt"])
+            preview = findings["previews"][0]["text"]
+            self.assertNotIn("hunter2", preview)
+            self.assertIn("<redacted>", preview)
+            self.assertLessEqual(len(preview), FilesystemNavigator.PREVIEW_SIZE + 32)
+
+        def test_36_read_only_and_denied_dir(self):
+            blocked = self.root / "bloccata"
+            blocked.mkdir()
+            (blocked / "mio.txt").write_text("segreta", encoding="utf-8")
+            (self.root / "aperto.txt").write_text("visibile", encoding="utf-8")
+            blocked.chmod(0o000)
+            try:
+                real_open = builtins.open
+
+                def guarded_open(*args, **kwargs):
+                    mode = kwargs.get("mode", args[1] if len(args) > 1 else "r")
+                    if any(flag in mode for flag in ("w", "a", "x", "+")):
+                        raise AssertionError(f"scrittura vietata: open({args[0]!r}, {mode!r})")
+                    return real_open(*args, **kwargs)
+
+                with patch("builtins.open", side_effect=guarded_open):
+                    findings = FilesystemNavigator(roots=[self.root]).find("mio aperto")
+            finally:
+                blocked.chmod(0o700)
+            self.assertEqual({Path(item["path"]).name for item in findings["paths"]},
+                             {"aperto.txt"})
+
+        def test_37_propose_includes_filesystem_context(self):
+            document = self.root / "documento_importante.txt"
+            document.write_text("dettagli segreti del progetto", encoding="utf-8")
+            agent = ZaAgent(self.config, database=self.db, engine=Mock())
+            agent.engine.last_metrics = {}
+            agent.engine.generate.return_value = '{"explanation":"ok","language":"bash","code":"true"}'
+            agent.navigator = FilesystemNavigator(roots=[self.root])
+            with patch("os.getcwd", return_value=str(self.root)):
+                proposal, meta = agent.propose("modifica il documento importante")
+            messages = agent.engine.generate.call_args.args[0]
+            user_message = next(message["content"] for message in messages if message["role"] == "user")
+            system_message = next(message["content"] for message in messages if message["role"] == "system")
+            self.assertIn("documento_importante.txt", user_message)
+            self.assertIn("dettagli segreti del progetto", user_message)
+            self.assertIn("Percorsi reali rilevanti", user_message)
+            self.assertIn("esistono davvero", system_message)
+            self.assertIn("filesystem_seconds", meta)
+            self.assertEqual(proposal.code, "true")
+
+        def test_38_symlinked_dir_is_not_followed(self):
+            (self.root / "dato.txt").write_text("reale", encoding="utf-8")
+            os.symlink(str(self.root), self.root / "loop")
+            findings = FilesystemNavigator(roots=[self.root]).find("dato loop")
+            self.assertEqual({Path(item["path"]).name for item in findings["paths"]},
+                             {"dato.txt"})
+            self.assertEqual([Path(item["path"]).name for item in findings["previews"]],
+                             ["dato.txt"])
+
+        def test_39_resolve_extracts_candidate_and_bare_name(self):
+            self.db.upsert_application({"source": "native", "identifier": "gimp", "name": "GIMP",
+                                        "description": "image editor", "launch": ["gimp"]})
+            self.db.upsert_application({"source": "native", "identifier": "paint", "name": "Paint",
+                                        "description": "draw", "launch": ["paint"]})
+            self.db.connection.commit(); self.db.rebuild_application_fts()
+            resolver = ApplicationResolver(self.db)
+            self.assertEqual(resolver.resolve_request("apri gimp per modificare")["identifier"], "gimp")
+            self.assertEqual(resolver.resolve_request('apri "paint"')["identifier"], "paint")
+            self.assertEqual(resolver.resolve_request("gimp")["identifier"], "gimp")
+            self.assertIsNone(resolver.resolve_request("modifica il documento importante"))
+
+        def test_40_search_ranks_usage_and_fuzzy(self):
+            self.db.upsert_application({"source": "native", "identifier": "paint", "name": "Paint",
+                                        "description": "image editor", "launch": ["paint"]})
+            self.db.upsert_application({"source": "native", "identifier": "gimp", "name": "GIMP",
+                                        "description": "image editor", "launch": ["gimp"]})
+            self.db.connection.execute("UPDATE applications SET uses=5 WHERE identifier='paint'")
+            self.db.connection.commit(); self.db.rebuild_application_fts()
+            resolver = ApplicationResolver(self.db)
+            self.assertEqual(resolver.search("image")[0]["identifier"], "paint")
+            self.assertEqual(resolver.search("pint")[0]["identifier"], "paint")
+
+        def test_41_search_falls_back_to_path(self):
+            with patch("shutil.which", return_value="/usr/bin/gimp"):
+                rows = ApplicationResolver(self.db).search("gimp")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(json.loads(rows[0]["launch_json"]), ["/usr/bin/gimp"])
+
+        def test_42_resolver_launch_bumps_usage(self):
+            self.db.upsert_application({"source": "native", "identifier": "paint", "name": "Paint",
+                                        "description": "editor", "launch": ["paint"]})
+            self.db.connection.commit(); self.db.rebuild_application_fts()
+            app = ApplicationResolver(self.db).resolve_request("apri paint")
+            proposal = CodeProposal("avvio", "bash", "paint", "process-started", "normal", "resolver",
+                                    generated_code="paint", argv=["paint"], app_id=app["id"])
+            agent = ZaAgent(self.config, database=self.db, engine=Mock())
+            agent.executor.start = Mock(return_value=Mock(pid=1))
+            agent.execute_approved("apri paint", proposal, "paint")
+            self.assertEqual(self.db.connection.execute(
+                "SELECT uses FROM applications WHERE identifier='paint'").fetchone()[0], 1)
+
+        def test_43_skill_reuse_for_rephrased_launch(self):
+            store = SkillStore(self.db)
+            proposal = CodeProposal("avvio gimp", "bash", "gimp", generated_code="gimp")
+            skill_id, version = store.create_candidate("apri gimp", proposal, proposal.code)
+            store.record_outcome(skill_id, version, True)
+            skills, _ = store.retrieve("avvia gimp per modificare")
+            self.assertTrue(skills)
+            reused = store.proposal_from_skill("avvia gimp per modificare", skills[0])
+            self.assertIsNotNone(reused)
+            self.assertEqual(reused.code, "gimp")
+
+        def test_44_generalize_any_single_path_command(self):
+            self.assertEqual(generalize_code("bash", "cat /etc/hostname | head -1"),
+                             ["cat", "{{arg1}}", "|", "head", "-1"])
+            self.assertIsNone(generalize_code("bash", "echo ciao"))
+            self.assertIsNone(generalize_code("python", "shutil.copy('/a','/b')"))
+
+        def test_44b_template_reuse_beyond_cp(self):
+            store = SkillStore(self.db)
+            first = CodeProposal("header", "bash", "cat /etc/hostname | head -1",
+                                 generated_code="cat /etc/hostname | head -1")
+            skill_id, version = store.create_candidate("leggi /etc/hostname", first, first.code)
+            store.record_outcome(skill_id, version, True)
+            second = CodeProposal("header", "bash", "cat /etc/issue | head -1",
+                                  generated_code="cat /etc/issue | head -1")
+            _, version = store.create_candidate("leggi /etc/issue", second, second.code)
+            store.record_outcome(skill_id, version, True)
+            skills, _ = store.retrieve("leggi /etc/os-release")
+            self.assertTrue(skills)
+            reused = store.proposal_from_skill("leggi /etc/os-release", skills[0])
+            self.assertEqual(reused.code, "cat /etc/os-release '|' head -1")
+
+        def test_45_old_schema_gains_uses_column(self):
+            path = self.root / "old2.sqlite"
+            connection = sqlite3.connect(path)
+            connection.executescript("""CREATE TABLE schema_info(version INTEGER NOT NULL);
+              INSERT INTO schema_info VALUES(2);
+              CREATE TABLE applications(id INTEGER PRIMARY KEY, source TEXT NOT NULL, identifier TEXT NOT NULL,
+                name TEXT NOT NULL, path TEXT, description TEXT, launch_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}', fingerprint TEXT, updated_at REAL NOT NULL,
+                UNIQUE(source, identifier));""")
+            connection.close()
+            migrated = SystemDatabase(path)
+            columns = {row[1] for row in migrated.connection.execute("PRAGMA table_info(applications)")}
+            self.assertIn("uses", columns)
+            migrated.close()
+
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
@@ -1920,6 +2539,8 @@ def build_parser():
                          help="crea in ~/.local/bin i collegamenti alle applicazioni")
     actions.add_argument("--list-apps", action="store_true", help="elenca le applicazioni trovate")
     actions.add_argument("--find-app", metavar="QUERY", help="cerca un'applicazione")
+    actions.add_argument("--find-files", metavar="QUERY",
+                         help="cerca file e cartelle per nome (senza caricare il modello)")
     actions.add_argument("--list-skills", action="store_true", help="elenca le procedure apprese")
     actions.add_argument("--skill", metavar="NAME", help="mostra una procedura")
     actions.add_argument("--revoke-skill", metavar="NAME", help="revoca una procedura")
@@ -1944,6 +2565,10 @@ def command_line(agent, args):
     if args.find_app:
         for row in agent.resolver.search(args.find_app):
             print(f"{row['name']}\t{row['source']}\t{row['identifier']}")
+        return
+    if args.find_files:
+        for item in agent.navigator.find(args.find_files)["paths"]:
+            print(f"{item['path']}\t{item['kind']}\t{item['size']}")
         return
     if args.list_skills:
         for row in agent.skills.list():
