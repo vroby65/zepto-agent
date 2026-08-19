@@ -797,6 +797,17 @@ class FilesystemNavigator:
     EXTENSION_WORDS = frozenset(ext.lstrip(".") for ext in TEXT_EXTENSIONS)
     NOISE_DIRS = frozenset({"node_modules", "site-packages", "venv", "dist", "build",
                             "target", "vendor"})
+    # Le cartelle nascoste non sono tutte rumore: la configurazione delle
+    # applicazioni sta quasi sempre sotto ~/.config o ~/.local, cioe' proprio
+    # dove serve guardare quando la richiesta parla di "configurazione di X".
+    # Si saltano allora solo quelle note: cache e store di pacchetti, che sono
+    # enormi e irrilevanti, e le directory di credenziali, che non devono
+    # finire in anteprima nemmeno per sbaglio.
+    HIDDEN_NOISE_DIRS = frozenset({
+        ".git", ".hg", ".svn", ".cache", ".ccache", ".npm", ".yarn", ".pnpm-store",
+        ".cargo", ".rustup", ".gradle", ".m2", ".nuget", ".venv", ".tox",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", ".steam", ".mozilla",
+        ".thunderbird", ".wine", ".var", ".ssh", ".gnupg", ".password-store"})
     USER_DIRS = ("Documenti", "Scaricati", "Scrivania", "Desktop",
                  "Documents", "Downloads")
     STOPWORDS = frozenset((
@@ -865,21 +876,24 @@ class FilesystemNavigator:
             for entry in entries:
                 if len(results) >= self.MAX_RESULTS:
                     return
-                if entry.name.startswith("."):
-                    continue
                 try:
                     is_dir = entry.is_dir(follow_symlinks=False)
                     is_file = entry.is_file(follow_symlinks=False)
                 except OSError:
                     continue
                 if is_dir:
-                    if entry.name in self.NOISE_DIRS:
+                    if entry.name in self.NOISE_DIRS or entry.name in self.HIDDEN_NOISE_DIRS:
                         continue
                     if any(keyword in entry.name.casefold() for keyword in keywords):
                         results.append({"path": entry.path, "kind": "dir", "size": 0})
                     if depth < self.MAX_DEPTH:
                         self._walk(entry.path, keywords, depth + 1, results, previews)
                 elif is_file:
+                    # I file nascosti restano fuori: sono per lo piu' dotfile di
+                    # stato e la loro anteprima porterebbe nel prompt roba come
+                    # .bash_history o .env senza che nessuno l'abbia chiesta.
+                    if entry.name.startswith("."):
+                        continue
                     if not any(keyword in entry.name.casefold() for keyword in keywords):
                         continue
                     try:
@@ -2362,6 +2376,39 @@ def run_self_tests():
             findings = FilesystemNavigator(roots=[self.root]).find("utile")
             self.assertEqual({Path(item["path"]).name for item in findings["paths"]},
                              {"utile.txt"})
+
+        def test_33b_reaches_config_inside_hidden_dirs(self):
+            config = self.root / ".config" / "ai-bar"
+            config.mkdir(parents=True)
+            (config / "config.json").write_text('{"panel": {}}', encoding="utf-8")
+            findings = FilesystemNavigator(roots=[self.root]).find("config di ai-bar")
+            paths = {item["path"] for item in findings["paths"]}
+            self.assertIn(str(config / "config.json"), paths)
+            self.assertIn(str(config), paths)
+
+        def test_33c_hidden_caches_stay_out(self):
+            for name in (".cache", ".venv", ".ssh"):
+                pesante = self.root / name / "progetto"
+                pesante.mkdir(parents=True)
+                (pesante / "config.json").write_text("{}", encoding="utf-8")
+            (self.root / ".config").mkdir()
+            (self.root / ".config" / "config.json").write_text("{}", encoding="utf-8")
+            findings = FilesystemNavigator(roots=[self.root]).find("config")
+            self.assertEqual({item["path"] for item in findings["paths"]},
+                             {str(self.root / ".config"),
+                              str(self.root / ".config" / "config.json")})
+
+        def test_33d_hidden_files_are_never_previewed(self):
+            (self.root / ".config").mkdir()
+            (self.root / ".config" / ".env").write_text(
+                "token=hunter2", encoding="utf-8")
+            (self.root / ".config" / "env.json").write_text("{}", encoding="utf-8")
+            findings = FilesystemNavigator(roots=[self.root]).find("env")
+            names = {Path(item["path"]).name for item in findings["paths"]}
+            self.assertEqual(names, {"env.json"})
+            self.assertEqual([Path(item["path"]).name for item in findings["previews"]],
+                             ["env.json"])
+            self.assertNotIn("hunter2", str(findings["previews"]))
 
         def test_34_bounded_results(self):
             for number in range(50):
