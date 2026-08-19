@@ -786,6 +786,10 @@ class FilesystemNavigator:
 
     MAX_DEPTH = 3
     MAX_RESULTS = 40
+    # Si raccoglie molto piu' di quanto se ne mostri: fermare la camminata al
+    # quarantesimo match significherebbe consegnare al modello i primi quaranta
+    # nell'ordine di scandir, che non ha niente a che vedere con la pertinenza.
+    MAX_CANDIDATES = 2000
     PREVIEW_LIMIT = 3
     PREVIEW_SIZE = 2048
     MAX_FILE_SIZE = 16 * 1024
@@ -865,8 +869,8 @@ class FilesystemNavigator:
                 unique.append(root)
         return unique
 
-    def _walk(self, root, keywords, depth, results, previews):
-        if len(results) >= self.MAX_RESULTS:
+    def _walk(self, root, keywords, depth, results):
+        if len(results) >= self.MAX_CANDIDATES:
             return
         try:
             entries = os.scandir(root)
@@ -874,7 +878,7 @@ class FilesystemNavigator:
             return
         with entries:
             for entry in entries:
-                if len(results) >= self.MAX_RESULTS:
+                if len(results) >= self.MAX_CANDIDATES:
                     return
                 try:
                     is_dir = entry.is_dir(follow_symlinks=False)
@@ -887,7 +891,7 @@ class FilesystemNavigator:
                     if any(keyword in entry.name.casefold() for keyword in keywords):
                         results.append({"path": entry.path, "kind": "dir", "size": 0})
                     if depth < self.MAX_DEPTH:
-                        self._walk(entry.path, keywords, depth + 1, results, previews)
+                        self._walk(entry.path, keywords, depth + 1, results)
                 elif is_file:
                     # I file nascosti restano fuori: sono per lo piu' dotfile di
                     # stato e la loro anteprima porterebbe nel prompt roba come
@@ -901,12 +905,6 @@ class FilesystemNavigator:
                     except OSError:
                         continue
                     results.append({"path": entry.path, "kind": "file", "size": size})
-                    if (len(previews) < self.PREVIEW_LIMIT
-                            and Path(entry.name).suffix.casefold() in self.TEXT_EXTENSIONS
-                            and size <= self.MAX_FILE_SIZE):
-                        preview = self._preview(entry.path)
-                        if preview:
-                            previews.append(preview)
 
     def _preview(self, path):
         try:
@@ -916,18 +914,46 @@ class FilesystemNavigator:
             return None
         return {"path": path, "text": redact_sensitive(text)}
 
+    def _relevance(self, item, keywords):
+        """Chiave di ordinamento: piu' parole della richiesta il nome soddisfa,
+        meglio e'; a parita', un nome che coincide con una parola batte una
+        semplice sottostringa, e un percorso vicino alla radice batte uno
+        sepolto in fondo. Il percorso chiude come spareggio deterministico."""
+        name = Path(item["path"]).name.casefold()
+        stem = name.rsplit(".", 1)[0]
+        matched = sum(1 for keyword in keywords if keyword in name)
+        exact = any(keyword in (name, stem) for keyword in keywords)
+        return (-matched, not exact, item["path"].count(os.sep), item["path"].casefold())
+
+    def _collect_previews(self, results):
+        previews = []
+        for item in results:
+            if len(previews) >= self.PREVIEW_LIMIT:
+                break
+            if (item["kind"] == "file"
+                    and Path(item["path"]).suffix.casefold() in self.TEXT_EXTENSIONS
+                    and item["size"] <= self.MAX_FILE_SIZE):
+                preview = self._preview(item["path"])
+                if preview:
+                    previews.append(preview)
+        return previews
+
     def find(self, request):
         started = time.monotonic()
         keywords = self._keywords(request)
-        results, previews = [], []
+        results = []
         if keywords:
             for root in self._candidate_roots(request):
-                self._walk(root, keywords, 0, results, previews)
-                if len(results) >= self.MAX_RESULTS:
+                self._walk(root, keywords, 0, results)
+                if len(results) >= self.MAX_CANDIDATES:
                     break
-        results.sort(key=lambda item: item["path"].casefold())
-        return {"paths": results[:self.MAX_RESULTS],
-                "previews": previews[:self.PREVIEW_LIMIT],
+        results.sort(key=lambda item: self._relevance(item, keywords))
+        results = results[:self.MAX_RESULTS]
+        # Le anteprime si scelgono dopo l'ordinamento: prima seguivano l'ordine
+        # di scandir e potevano descrivere tre file qualsiasi invece dei piu'
+        # pertinenti fra quelli mostrati.
+        return {"paths": results,
+                "previews": self._collect_previews(results),
                 "seconds": time.monotonic() - started}
 
     def describe(self, paths, previews):
@@ -2416,6 +2442,31 @@ def run_self_tests():
             findings = FilesystemNavigator(roots=[self.root]).find("match")
             self.assertEqual(len(findings["paths"]), FilesystemNavigator.MAX_RESULTS)
             self.assertEqual(len(findings["paths"]), 40)
+
+        def test_34b_relevant_match_survives_the_cap(self):
+            # Molti omonimi poco pertinenti, sparsi in modo da riempire il cap
+            # prima che scandir arrivi al file che conta davvero.
+            for number in range(80):
+                rumore = self.root / f"z_ramo_{number:02d}"
+                rumore.mkdir()
+                (rumore / "config_appunti.txt").write_text("x", encoding="utf-8")
+            atteso = self.root / "ai-bar"
+            atteso.mkdir()
+            (atteso / "config.json").write_text('{"panel": {}}', encoding="utf-8")
+            findings = FilesystemNavigator(roots=[self.root]).find("config di ai-bar")
+            paths = [item["path"] for item in findings["paths"]]
+            self.assertEqual(len(paths), FilesystemNavigator.MAX_RESULTS)
+            self.assertIn(str(atteso / "config.json"), paths)
+            self.assertEqual(paths[0], str(atteso / "config.json"),
+                             "il match esatto deve venire prima degli omonimi")
+
+        def test_34c_previews_follow_relevance(self):
+            for number in range(10):
+                (self.root / f"a_config_vecchio_{number}.txt").write_text(
+                    "rumore", encoding="utf-8")
+            (self.root / "config.json").write_text('{"vero": 1}', encoding="utf-8")
+            findings = FilesystemNavigator(roots=[self.root]).find("config")
+            self.assertEqual(Path(findings["previews"][0]["path"]).name, "config.json")
 
         def test_35_preview_only_small_text(self):
             (self.root / "appunti.txt").write_text(
