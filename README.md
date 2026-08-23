@@ -70,6 +70,14 @@ When a fresh proposal is needed, Za also navigates the filesystem read-only: it
 matches file and folder names against the request and hands the real existing
 paths (plus short, redacted previews of small text files) to the model, so
 proposed commands reference actual locations instead of invented ones.
+Before generation, Za corrects user-supplied paths only when the filesystem
+match is unique. It then applies the same case-sensitive check to every literal
+path in model-generated code and rejects proposals containing unresolved paths.
+Requests with a creation intent (`crea`, `copia`, `sposta`, `rinomina`, ...) may
+legitimately name paths that do not exist yet: Za resolves the longest existing
+prefix, keeps the new tail as typed, and only then accepts the same paths in the
+model code. If a generation is not valid JSON or refers to an unresolved path,
+Za asks the model once to correct itself, appending the reason, before giving up.
 `--find-files QUERY` performs the same name search from the command line and
 prints `path<TAB>kind<TAB>size` without loading the model.
 

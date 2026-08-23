@@ -22,7 +22,19 @@ import tempfile
 import textwrap
 import threading
 import time
+import warnings
 from pathlib import Path
+
+
+# Il modello caricato ha temperature/top_p/top_k non di default, mentre la
+# generazione usa do_sample=False: transformers segnala l'incoerenza a ogni
+# chiamata. Filtriamo solo quei tre avvisi, senza cambiare le impostazioni.
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    message=r"`do_sample` is set to `False`",
+    module="transformers.generation.configuration_utils",
+)
 
 
 MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
@@ -556,6 +568,17 @@ def has_launch_intent(request):
     return 1 <= len(words) <= 4
 
 
+CREATE_VERB_WORDS = frozenset("crea creare copia copiare sposta spostare muovi muovere "
+                              "rinomina rinominare estrai estrarre scarica scaricare "
+                              "salva salvare scrivi scrivere aggiungi aggiungere".split())
+
+
+def has_creation_intent(request):
+    """Vero se la richiesta può legittimamente riferirsi a percorsi che non esistono ancora."""
+    words = re.findall(r"[A-Za-zÀ-ÿ0-9_]+", request.casefold(), re.UNICODE)
+    return bool(CREATE_VERB_WORDS.intersection(words))
+
+
 def choose_application(candidates):
     """Sceglie tra più applicazioni simili; in un terminale interattivo chiede all'utente."""
     if len(candidates) < 2 or not sys.stdin.isatty():
@@ -777,8 +800,114 @@ def generalize_code(language, code):
     return template
 
 
+PATH_MENTION = re.compile(
+    r'''(?P<quote>["'])(?P<quoted>(?:~(?:/|$)|/|\.\.?/)[^"'\r\n]*?)(?P=quote)'''
+    r'''|(?P<plain>(?<![\w:])(?:~(?:/|$)|/|\.\.?/)[^\s'"`;|&<>(){}\[\],]*)''')
+
+
+def path_mentions(text):
+    return [match.group("quoted") or match.group("plain")
+            for match in PATH_MENTION.finditer(text)]
+
+
 def request_paths(request):
-    return re.findall(r"(?:~|/)[^\s'\"]+", request)
+    return path_mentions(request)
+
+
+class PathTool:
+    """Verifica e corregge percorsi locali senza ignorare maiuscole e minuscole."""
+
+    def __init__(self, cwd=None):
+        self.cwd = Path(cwd or os.getcwd()).absolute()
+
+    @staticmethod
+    def _choose_name(wanted, names):
+        if wanted in names:
+            return wanted
+        same_casefold = [name for name in names if name.casefold() == wanted.casefold()]
+        if len(same_casefold) == 1:
+            return same_casefold[0]
+        if same_casefold:
+            return None
+        ranked = sorted(
+            ((difflib.SequenceMatcher(None, wanted.casefold(), name.casefold()).ratio(), name)
+             for name in names), reverse=True)
+        ranked = [item for item in ranked if item[0] >= 0.82]
+        if not ranked or (len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.10):
+            return None
+        return ranked[0][1]
+
+    def _absolute(self, path):
+        expanded = Path(os.path.expanduser(path))
+        if not expanded.is_absolute():
+            expanded = self.cwd / expanded
+        return Path(os.path.abspath(expanded))
+
+    def _correct_components(self, path):
+        absolute = self._absolute(path)
+        current = Path(absolute.anchor)
+        for part in absolute.parts[1:]:
+            try:
+                names = [entry.name for entry in os.scandir(current)]
+            except OSError:
+                return None
+            chosen = self._choose_name(part, names)
+            if chosen is None:
+                return None
+            current /= chosen
+        return str(current) if current.exists() else None
+
+    def resolve(self, path, known_paths=()):
+        corrected = self._correct_components(path)
+        if corrected:
+            return corrected
+        existing = []
+        for candidate in known_paths:
+            candidate = self._absolute(candidate)
+            if candidate.exists():
+                existing.append(str(candidate))
+        wanted = Path(os.path.expanduser(path)).name
+        chosen = self._choose_name(wanted, [Path(item).name for item in existing])
+        if chosen is None:
+            return None
+        matches = [item for item in existing if Path(item).name == chosen]
+        return matches[0] if len(matches) == 1 else None
+
+    def resolve_new(self, path):
+        """Risolve un percorso destinato a essere creato: corregge il case del
+        prefisso esistente più lungo e conserva intatta la coda nuova."""
+        absolute = self._absolute(path)
+        suffix = []
+        current = absolute
+        while True:
+            corrected = self._correct_components(str(current))
+            if corrected:
+                base = Path(corrected)
+                for part in reversed(suffix):
+                    base /= part
+                return str(base)
+            if current == current.parent:
+                return None
+            suffix.append(current.name)
+            current = current.parent
+
+    def correct_text(self, text, known_paths=(), allow_new=False):
+        changes, unresolved = [], []
+
+        def replace(match):
+            original = match.group("quoted") or match.group("plain")
+            corrected = self.resolve(original, known_paths)
+            if corrected is None and allow_new:
+                corrected = self.resolve_new(original)
+            if corrected is None:
+                unresolved.append(original)
+                return match.group(0)
+            if corrected != original:
+                changes.append((original, corrected))
+            quote = match.group("quote") or ""
+            return f"{quote}{corrected}{quote}"
+
+        return PATH_MENTION.sub(replace, text), changes, unresolved
 
 
 class FilesystemNavigator:
@@ -1391,6 +1520,7 @@ class ZaAgent:
         self.skills = SkillStore(self.db)
         self.skills.ensure_builtins()
         self.navigator = FilesystemNavigator()
+        self.path_tool = PathTool()
         self.engine = engine or ModelEngine(config)
         self.executor, self.validator = Executor(config.timeout), Validator()
         self._import_legacy_history()
@@ -1420,6 +1550,19 @@ class ZaAgent:
         return {"cwd": os.getcwd(), "applications": app_context, "skills": skill_context}
 
     def propose(self, request):
+        creation = has_creation_intent(request)
+        findings = None
+        request, corrections, unresolved = self.path_tool.correct_text(request, allow_new=creation)
+        if unresolved:
+            findings = self.navigator.find(request)
+            known_paths = [item["path"] for item in findings["paths"]]
+            request, found_corrections, unresolved = self.path_tool.correct_text(
+                request, known_paths, allow_new=creation)
+            corrections.extend(found_corrections)
+        if unresolved:
+            raise ValueError(f"Il percorso {unresolved[0]} non esiste o non ha una correzione univoca.")
+        if corrections:
+            show_status("✓", f"Ho corretto {len(corrections)} percorso/i verificando il case.", ANSI_GREEN)
         show_status("⌕", "Cerco procedure collaudate pertinenti…", ANSI_CYAN)
         skills, search_seconds = self.skills.retrieve(request)
         for skill in skills:
@@ -1439,7 +1582,7 @@ class ZaAgent:
         related_apps = self.resolver.search(request, 3)
         context = self.system_context(related_apps, self.skills.relevant_descriptions(request))
         fs_started = time.monotonic()
-        findings = self.navigator.find(request)
+        findings = findings or self.navigator.find(request)
         filesystem_seconds = time.monotonic() - fs_started
         filesystem_block = self.navigator.describe(findings["paths"], findings["previews"])
         if findings["paths"]:
@@ -1448,19 +1591,44 @@ class ZaAgent:
 su file, directory, filesystem, dispositivi montati e spazio disco. Rispondi nella lingua dell'utente.
 Spiega brevemente cosa hai capito e cosa proponi. Non inventare percorsi, applicazioni o comandi:
 usa solo richiesta e contesto forniti. I percorsi elencati in 'Percorsi reali rilevanti' esistono davvero
-sul filesystem: usali come sono, senza inventarne o crearne di nuovi. Non eseguire nulla.
+sul filesystem: usali come sono, con lo stesso case e in forma assoluta, senza inventarne o crearne di nuovi.
+Ogni percorso letterale nel codice deve esistere ed essere uno dei percorsi verificabili dal contesto. Non eseguire nulla.
 Restituisci esclusivamente JSON valido:
 {"explanation":"...","language":"python|bash|fish","code":"...","verification":"...","risk":"normal|high"}.
+Esempio del formato (non eseguirlo):
+{"explanation":"Elencherò i file della directory /tmp.","language":"bash","code":"ls -la /tmp","verification":"exit-code","risk":"normal"}
 Il codice deve essere ripetibile, usare argv/subprocess senza shell quando possibile e comunicare errori utili."""
         user = f"Contesto macchina pertinente:\n{json.dumps(context, ensure_ascii=False)}"
         if filesystem_block:
             user += f"\n\nPercorsi reali rilevanti:\n{filesystem_block}"
         user += f"\n\nRichiesta: {request}"
-        raw = self.engine.generate([{"role": "system", "content": system},
-                                    {"role": "user", "content": user}])
-        proposal = parse_model_output(raw)
-        if proposal:
+        known_paths = [item["path"] for item in findings["paths"]]
+        failure = ""
+        for _ in range(2):
+            attempt = user
+            if failure:
+                attempt += (f"\n\nIl tentativo precedente non era valido: {failure}."
+                            " Rispondi con il solo JSON richiesto, senza testo aggiuntivo.")
+            raw = self.engine.generate([{"role": "system", "content": system},
+                                        {"role": "user", "content": attempt}])
+            proposal = parse_model_output(raw)
+            if not proposal:
+                snippet = re.sub(r"\s+", " ", raw).strip()[:200] or "vuoto"
+                failure = f"output non strutturato ({snippet})"
+                continue
             proposal.generated_code = proposal.code
+            code, corrections, unresolved = self.path_tool.correct_text(
+                proposal.code, known_paths, allow_new=creation)
+            if unresolved:
+                failure = f"Il percorso {unresolved[0]} non esiste o non ha una correzione univoca."
+                continue
+            proposal.code = code
+            if corrections:
+                proposal.argv = None
+                show_status("✓", f"Ho corretto {len(corrections)} percorso/i nella proposta.", ANSI_GREEN)
+            break
+        else:
+            raise ValueError(failure or "Il modello non ha prodotto una proposta valida.")
         return proposal, {"skill_search_seconds": search_seconds,
                           "filesystem_seconds": filesystem_seconds,
                           **self.engine.last_metrics}
@@ -2524,6 +2692,117 @@ def run_self_tests():
             columns = {row[1] for row in migrated.connection.execute("PRAGMA table_info(applications)")}
             self.assertIn("uses", columns)
             migrated.close()
+
+        def test_46_path_tool_corrects_case_and_unique_typo(self):
+            folder = self.root / "Documenti"
+            folder.mkdir()
+            document = folder / "Report Finale.txt"
+            document.write_text("report", encoding="utf-8")
+            wrong = self.root / "documenti" / "Reprot Finale.txt"
+            corrected, changes, unresolved = PathTool(self.root).correct_text(
+                f'leggi "{wrong}"')
+            self.assertEqual(corrected, f'leggi "{document}"')
+            self.assertEqual(changes, [(str(wrong), str(document))])
+            self.assertEqual(unresolved, [])
+
+        def test_47_path_tool_does_not_guess_ambiguous_case(self):
+            (self.root / "Report.txt").write_text("uno", encoding="utf-8")
+            (self.root / "report.txt").write_text("due", encoding="utf-8")
+            requested = self.root / "REPORT.TXT"
+            corrected, changes, unresolved = PathTool(self.root).correct_text(
+                f"leggi {requested}")
+            self.assertEqual(corrected, f"leggi {requested}")
+            self.assertEqual(changes, [])
+            self.assertEqual(unresolved, [str(requested)])
+
+        def test_48_model_path_is_corrected_after_name_search(self):
+            document = self.root / "DocumentoImportante.TXT"
+            document.write_text("contenuto", encoding="utf-8")
+            wrong = self.root / "documentoimportante.txt"
+            engine = Mock(last_metrics={})
+            engine.generate.return_value = json.dumps({
+                "explanation": "leggo il documento", "language": "bash",
+                "code": f"cat {wrong}", "verification": "exit-code", "risk": "normal"})
+            agent = ZaAgent(self.config, database=self.db, engine=engine)
+            agent.navigator = FilesystemNavigator(roots=[self.root])
+            proposal, _ = agent.propose("leggi il documento importante")
+            self.assertEqual(proposal.code, f"cat {document}")
+            self.assertEqual(proposal.generated_code, f"cat {wrong}")
+
+        def test_49_model_path_must_exist(self):
+            missing = self.root / "CartellaInventata" / "file.txt"
+            engine = Mock(last_metrics={})
+            engine.generate.return_value = json.dumps({
+                "explanation": "leggo il documento", "language": "bash",
+                "code": f"cat {missing}", "verification": "exit-code", "risk": "normal"})
+            agent = ZaAgent(self.config, database=self.db, engine=engine)
+            agent.navigator = FilesystemNavigator(roots=[self.root])
+            with self.assertRaisesRegex(ValueError, "non esiste"):
+                agent.propose("leggi il documento")
+
+        def test_50_retry_after_unstructured_output(self):
+            engine = Mock(last_metrics={})
+            engine.generate.side_effect = [
+                "parliamo del tempo senza alcuna struttura",
+                json.dumps({"explanation": "ok", "language": "bash", "code": "echo ciao",
+                            "verification": "exit-code", "risk": "normal"})]
+            agent = ZaAgent(self.config, database=self.db, engine=engine)
+            agent.navigator = FilesystemNavigator(roots=[self.root])
+            proposal, _ = agent.propose("saluta")
+            self.assertEqual(proposal.code, "echo ciao")
+            self.assertEqual(engine.generate.call_count, 2)
+            retry_user = next(message["content"] for message in
+                              engine.generate.call_args_list[1].args[0]
+                              if message["role"] == "user")
+            self.assertIn("tentativo precedente", retry_user)
+
+        def test_51_retry_after_invented_path(self):
+            missing = self.root / "PercorsoInventato" / "dato.txt"
+            engine = Mock(last_metrics={})
+            engine.generate.side_effect = [
+                json.dumps({"explanation": "a", "language": "bash", "code": f"cat {missing}",
+                            "verification": "exit-code", "risk": "normal"}),
+                json.dumps({"explanation": "b", "language": "bash", "code": "echo ok",
+                            "verification": "exit-code", "risk": "normal"})]
+            agent = ZaAgent(self.config, database=self.db, engine=engine)
+            agent.navigator = FilesystemNavigator(roots=[self.root])
+            proposal, _ = agent.propose("leggi il documento")
+            self.assertEqual(proposal.code, "echo ok")
+            self.assertEqual(engine.generate.call_count, 2)
+
+        def test_52_creation_target_path_is_allowed(self):
+            target = self.root / "nuova" / "cartella"
+            engine = Mock(last_metrics={})
+            engine.generate.return_value = json.dumps({
+                "explanation": "creo la cartella", "language": "bash",
+                "code": f"mkdir -p {target}", "verification": "exit-code", "risk": "normal"})
+            agent = ZaAgent(self.config, database=self.db, engine=engine)
+            agent.navigator = FilesystemNavigator(roots=[self.root])
+            proposal, _ = agent.propose(f"crea la cartella {target}")
+            self.assertEqual(proposal.code, f"mkdir -p {target}")
+            self.assertEqual(engine.generate.call_count, 1)
+
+        def test_53_new_path_rejected_without_creation_intent(self):
+            target = self.root / "nuova" / "cartella"
+            engine = Mock(last_metrics={})
+            engine.generate.return_value = json.dumps({
+                "explanation": "creo la cartella", "language": "bash",
+                "code": f"mkdir -p {target}", "verification": "exit-code", "risk": "normal"})
+            agent = ZaAgent(self.config, database=self.db, engine=engine)
+            agent.navigator = FilesystemNavigator(roots=[self.root])
+            with self.assertRaisesRegex(ValueError, "non esiste"):
+                agent.propose("quanto spazio occupa la cartella")
+
+        def test_54_resolve_new_corrects_existing_prefix_case(self):
+            folder = self.root / "Documenti"
+            folder.mkdir()
+            wrong = self.root / "DOCUMENTI" / "Report Finale.txt"
+            self.assertEqual(PathTool(self.root).resolve_new(str(wrong)),
+                             str(folder / "Report Finale.txt"))
+            corrected, changes, unresolved = PathTool(self.root).correct_text(
+                f'touch "{wrong}"', allow_new=True)
+            self.assertEqual(corrected, f'touch "{folder / "Report Finale.txt"}"')
+            self.assertEqual(unresolved, [])
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
