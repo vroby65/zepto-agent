@@ -2,8 +2,12 @@
 
 Za is a local Linux micro-agent powered by
 `Qwen/Qwen2.5-Coder-1.5B-Instruct`, focused on files, directories, filesystems,
-mounted devices, and disk-space operations. The model is loaded directly with
-Transformers; Ollama and llama.cpp are not required.
+mounted devices, and disk-space operations. The model runs by default through
+`llama-cpp-python`, a pip-only Python package that bundles the llama.cpp core
+inside the wheel (no system installation needed): the same Qwen model in GGUF
+Q4_K_M format is faster on CPU, lighter (1.1 GB instead of 4.5 GB) and produces
+JSON that is guaranteed valid by a generation grammar. If `llama-cpp-python` or
+the GGUF file is missing, Za falls back automatically to the Transformers path.
 
 Za inventories installed applications, retrieves machine-compatible procedures,
 and asks the model only when deterministic resolution is insufficient. Every
@@ -18,8 +22,9 @@ successful uses, `trusted`. Model weights are never modified.
 ## Requirements and installation
 
 - Python 3.10 or newer
-- About 4 GB of disk space for the model
-- Enough memory to load a 1.5B model (BF16 is used on CPU; FP16 on CUDA)
+- About 1.2 GB of disk space for the default GGUF model (4.5 GB with the
+  Transformers fallback model)
+- Enough memory to run a 1.5B model (Q4 GGUF needs about 2 GB RAM)
 
 ```bash
 python3 -m venv .venv

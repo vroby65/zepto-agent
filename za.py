@@ -38,6 +38,8 @@ warnings.filterwarnings(
 
 
 MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+GGUF_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+GGUF_FILE = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
 LOGO_TEXT = (
     "",
     " ▀▀█ █▀█",
@@ -1406,6 +1408,76 @@ def _proposal_from_dict(value):
                         str(value.get("risk", "normal")), generated_code=code.strip())
 
 
+JSON_GRAMMAR = r"""root ::= object
+value ::= object | array | string | number | ("true" | "false" | "null") ws
+object ::= "{" ws ( string ":" ws value ("," ws string ":" ws value)* )? "}" ws
+array ::= "[" ws ( value ("," ws value)* )? "]" ws
+string ::= "\"" ( [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) )* "\"" ws
+number ::= ("-" | "+")? ("0" | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
+ws ::= [ \t\n]*
+"""
+
+
+class LlamaModelEngine:
+    """Backend llama-cpp-python: stessa interfaccia di ModelEngine, JSON garantito dalla grammar."""
+
+    def __init__(self, config):
+        self.config = config
+        self.llm = None
+        self.load_seconds = None
+        self.last_metrics = {}
+
+    def _gguf_path(self):
+        from huggingface_hub import try_to_load_from_cache
+        cached = try_to_load_from_cache(GGUF_MODEL, GGUF_FILE, cache_dir=self.config.model_cache)
+        return Path(cached) if cached else self.config.model_cache / GGUF_FILE
+
+    def cache_present(self):
+        return self._gguf_path().exists()
+
+    def load(self):
+        if self.llm is not None:
+            return self.llm
+        from llama_cpp import Llama, LlamaGrammar
+        path = self._gguf_path()
+        if not path.exists():
+            print(terminal_style("╭──────────────────────╮", ANSI_MAGENTA))
+            print(terminal_style("│ ↓  MODEL DOWNLOAD  ↓ │", ANSI_YELLOW))
+            print(terminal_style("╰──────────────────────╯", ANSI_BLUE))
+            show_status("◆", f"Scarico {GGUF_FILE}…", ANSI_GREEN)
+            show_status("→", str(self.config.model_cache), ANSI_CYAN)
+            from huggingface_hub import hf_hub_download
+            path = Path(hf_hub_download(GGUF_MODEL, GGUF_FILE, cache_dir=self.config.model_cache))
+        started = time.monotonic()
+        self.llm = Llama(model_path=str(path), n_ctx=4096, n_batch=512, verbose=False)
+        self.load_seconds = time.monotonic() - started
+        self.grammar = LlamaGrammar.from_string(JSON_GRAMMAR, verbose=False)
+        return self.llm
+
+    def generate(self, messages):
+        llm = self.load()
+        started = time.monotonic()
+        response = llm.create_chat_completion(
+            messages=messages, max_tokens=self.config.max_new_tokens,
+            temperature=0.2, repeat_penalty=self.config.repetition_penalty,
+            grammar=self.grammar)
+        elapsed = time.monotonic() - started
+        text = response["choices"][0]["message"]["content"]
+        tokens = response["usage"]["completion_tokens"]
+        self.last_metrics = {"generation_seconds": elapsed, "first_token_seconds": None,
+                             "prompt_tokens": response["usage"]["prompt_tokens"],
+                             "tokens": tokens, "tokens_per_second": tokens / elapsed if elapsed else 0}
+        return text
+
+
+def default_engine(config):
+    try:
+        import llama_cpp  # noqa: F401
+    except ImportError:
+        return ModelEngine(config)
+    return LlamaModelEngine(config)
+
+
 def parse_model_output(text):
     candidates = []
     fenced = re.search(r"```json\s*(.*?)```", text, re.I | re.S)
@@ -1558,7 +1630,7 @@ class ZaAgent:
         self.skills.ensure_builtins()
         self.navigator = FilesystemNavigator()
         self.path_tool = PathTool()
-        self.engine = engine or ModelEngine(config)
+        self.engine = engine or default_engine(config)
         self.executor, self.validator = Executor(config.timeout), Validator()
         self._import_legacy_history()
 
@@ -2868,6 +2940,11 @@ def run_self_tests():
                 '{"explanation":"x","language":"bash","code":"  "}'))
             self.assertIsNone(parse_model_output("parole senza struttura"))
 
+        def test_60_engine_dispatch_falls_back_without_llama_cpp(self):
+            with patch.dict("sys.modules", {"llama_cpp": None}):
+                self.assertIsInstance(default_engine(self.config), ModelEngine)
+            self.assertIsInstance(default_engine(self.config), LlamaModelEngine)
+
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
@@ -2932,7 +3009,8 @@ def command_line(agent, args):
         import torch
         print(json.dumps({"machine_cache": str(agent.config.cache_dir), "database": str(agent.db.path),
                           "database_recovered": str(agent.db.recovered_path or ""), "fts5": agent.db.fts,
-                          "model": MODEL, "model_cached": agent.engine.cache_present(),
+                          "backend": type(agent.engine).__name__, "model": MODEL,
+                          "model_cached": agent.engine.cache_present(),
                           "cuda": torch.cuda.is_available(), "device":
                           torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
                           "dtype": "float16" if torch.cuda.is_available() else "bfloat16",
