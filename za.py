@@ -1370,6 +1370,42 @@ class ModelEngine:
         return "".join(chunks)
 
 
+def repair_json(text):
+    """Recupera un oggetto JSON valido da un output malformato del modello."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    candidate = text[start:end + 1]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+    repaired = candidate
+    repaired = re.sub(r"/\*.*?\*/", "", repaired, flags=re.S)
+    repaired = re.sub(r"//[^\n\"']*", "", repaired)
+    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+    repaired = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', repaired)
+    if '"' not in repaired and "'" in repaired:
+        repaired = re.sub(r"'([^']*)'", r'"\1"', repaired)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+
+
+def _proposal_from_dict(value):
+    if not isinstance(value, dict) or value.get("language") not in LANGUAGE_ALIASES:
+        return None
+    code = value.get("code")
+    if not isinstance(code, str) or not code.strip():
+        return None
+    language = LANGUAGE_ALIASES[value["language"]]
+    return CodeProposal(str(value.get("explanation", "Proposta generata.")), language,
+                        code.strip(), str(value.get("verification", "exit-code")),
+                        str(value.get("risk", "normal")), generated_code=code.strip())
+
+
 def parse_model_output(text):
     candidates = []
     fenced = re.search(r"```json\s*(.*?)```", text, re.I | re.S)
@@ -1383,11 +1419,12 @@ def parse_model_output(text):
                 value, _ = decoder.raw_decode(candidate[start:])
             except json.JSONDecodeError:
                 continue
-            if isinstance(value, dict) and value.get("language") in LANGUAGE_ALIASES and isinstance(value.get("code"), str):
-                language = LANGUAGE_ALIASES[value["language"]]
-                return CodeProposal(str(value.get("explanation", "Proposta generata.")), language,
-                                    value["code"].strip(), str(value.get("verification", "exit-code")),
-                                    str(value.get("risk", "normal")), generated_code=value["code"].strip())
+            proposal = _proposal_from_dict(value)
+            if proposal:
+                return proposal
+        proposal = _proposal_from_dict(repair_json(candidate))
+        if proposal:
+            return proposal
     extracted = extract_code(text)
     if extracted:
         language, code = extracted
@@ -2803,6 +2840,33 @@ def run_self_tests():
                 f'touch "{wrong}"', allow_new=True)
             self.assertEqual(corrected, f'touch "{folder / "Report Finale.txt"}"')
             self.assertEqual(unresolved, [])
+
+        def test_55_repair_unquoted_keys_and_trailing_comma(self):
+            proposal = parse_model_output(
+                '{explanation: "x", language: "bash", code: "echo ok",}')
+            self.assertEqual(proposal.code, "echo ok")
+
+        def test_56_repair_single_quotes(self):
+            proposal = parse_model_output(
+                "{'explanation': 'x', 'language': 'bash', 'code': 'echo ok'}")
+            self.assertEqual(proposal.code, "echo ok")
+
+        def test_57_repair_comments_and_trailing_text(self):
+            proposal = parse_model_output(
+                "{\n  // nota\n  \"explanation\": \"x\", /* altro */\n"
+                "  \"language\": \"bash\",\n  \"code\": \"echo ok\"\n}"
+                " ecco del testo dopo l'oggetto")
+            self.assertEqual(proposal.code, "echo ok")
+
+        def test_58_colon_inside_string_is_untouched(self):
+            proposal = parse_model_output(
+                '{"explanation":"guarda: il file","language":"bash","code":"cat /tmp/a: b"}')
+            self.assertEqual(proposal.code, "cat /tmp/a: b")
+
+        def test_59_empty_code_is_not_a_proposal(self):
+            self.assertIsNone(parse_model_output(
+                '{"explanation":"x","language":"bash","code":"  "}'))
+            self.assertIsNone(parse_model_output("parole senza struttura"))
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1

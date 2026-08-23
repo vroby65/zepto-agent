@@ -78,6 +78,9 @@ legitimately name paths that do not exist yet: Za resolves the longest existing
 prefix, keeps the new tail as typed, and only then accepts the same paths in the
 model code. If a generation is not valid JSON or refers to an unresolved path,
 Za asks the model once to correct itself, appending the reason, before giving up.
+Before retrying, Za tries to repair common malformations in the model output
+(unquoted keys, trailing commas, single quotes, comments) and requires `code` to
+be non-empty.
 `--find-files QUERY` performs the same name search from the command line and
 prints `path<TAB>kind<TAB>size` without loading the model.
 
