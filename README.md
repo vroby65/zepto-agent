@@ -1,13 +1,10 @@
 # Za — Zepto-Agent
 
-Za is a local Linux micro-agent powered by
-`Qwen/Qwen2.5-Coder-1.5B-Instruct`, focused on files, directories, filesystems,
-mounted devices, and disk-space operations. The model runs by default through
-`llama-cpp-python`, a pip-only Python package that bundles the llama.cpp core
-inside the wheel (no system installation needed): the same Qwen model in GGUF
-Q4_K_M format is faster on CPU, lighter (1.1 GB instead of 4.5 GB) and produces
-JSON that is guaranteed valid by a generation grammar. If `llama-cpp-python` or
-the GGUF file is missing, Za falls back automatically to the Transformers path.
+Za is a Linux micro-agent focused on files, directories, filesystems, mounted
+devices, and disk-space operations. It sends generation requests to the local
+FreeLLMAPI gateway at `http://127.0.0.1:3001` through the OpenAI-compatible
+`/v1/chat/completions` endpoint and uses the `auto` routing model. Za has no
+local-model backend and downloads no model weights.
 
 Za inventories installed applications, retrieves machine-compatible procedures,
 and asks the model only when deterministic resolution is insufficient. Every
@@ -15,34 +12,59 @@ proposed Python, Bash, or Fish script is shown before execution and can be edite
 or cancelled. Pressing Enter approves normal-risk code; elevated-risk operations
 require typing `approve`.
 
+When the proposal comes from a stored procedure, the approval prompt also shows
+`d elimina procedura`. Pressing `d` deletes that procedure and all its versions
+from the database without executing it. Existing execution and feedback history
+is retained, but is no longer linked to the deleted procedure.
+
 Approved procedures and execution outcomes are stored in a machine-specific
 SQLite database. Successful procedures become `verified` and, after three
-successful uses, `trusted`. Model weights are never modified.
+successful uses, `trusted`.
 
 ## Requirements and installation
 
 - Python 3.10 or newer
-- About 1.2 GB of disk space for the default GGUF model (4.5 GB with the
-  Transformers fallback model)
-- Enough memory to run a 1.5B model (Q4 GGUF needs about 2 GB RAM)
+- `secret-tool` for the system keyring
+- A FreeLLMAPI gateway listening on port 3001
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
+chmod +x za.py
+mkdir -p ~/.local/bin
+ln -s "$(pwd)/za.py" ~/.local/bin/za
 ```
+
+Za uses only the Python standard library; `requirements.txt` is kept as an
+explicit record that no Python packages are required.
 
 ## Run
 
 ```bash
-./za.py
+za
 ```
 
-The model downloads only when absent and remains resident for the interactive
-session. Its existing Hugging Face cache is preserved at
-`~/.local/share/za/models` by default. Machine state is stored under
-`~/.cache/za/machines/<machine-hash>/`; override the base with `--cache-dir`
-or `ZA_CACHE_DIR`, and the model cache with `ZA_MODEL_CACHE`.
+The first time a generated proposal is needed, Za asks for the FreeLLMAPI
+unified key without echoing it and stores it in the system keyring with
+`application=freellmapi` and `account=default`. Later runs read it from there;
+the key is not read from environment variables or project files. Machine state
+is stored under `~/.cache/za/machines/<machine-hash>/`; override the base with
+`--cache-dir` or `ZA_CACHE_DIR`.
+
+### Start FreeLLMAPI at boot
+
+The included user service starts the existing Docker Compose installation from
+`~/freellmapi`. Link and enable it once:
+
+```bash
+mkdir -p ~/.config/systemd/user
+ln -s "$(pwd)/freellmapi.service" ~/.config/systemd/user/freellmapi.service
+systemctl --user daemon-reload
+systemctl --user enable --now freellmapi.service
+loginctl enable-linger "$USER"
+sudo systemctl enable --now docker.socket
+```
+
+Lingering lets the user service start during boot without waiting for an
+interactive login. The system Docker socket must also be enabled.
 
 Approved scripts start in the background (`&`). Za captures their standard
 output and errors in a terminal view with separate `Output` and `Errori`
@@ -54,22 +76,26 @@ feedback.
 ## Maintenance commands
 
 ```bash
-./za.py --scan
-./za.py --list-apps
-./za.py --find-app gimp
-./za.py --find-files report
-./za.py --list-skills
-./za.py --skill launch-application
-./za.py --revoke-skill NAME
-./za.py --delete-skill NAME
-./za.py --diagnose
-./za.py --benchmark
-./za.py --rebuild-cache
+za --scan
+za --list-apps
+za --find-app gimp
+za --find-files report
+za --list-skills
+za --skill launch-application
+za --revoke-skill NAME
+za --delete-skill NAME
+za --diagnose
+za --benchmark
+za --rebuild-cache
 ```
 
 `--rebuild-cache` removes and rebuilds only scanner-derived data. Learned
 procedures and execution history are retained. A corrupt database is preserved
 with a timestamped `.corrupt-*.sqlite` name before a clean index is created.
+Application and learned-procedure searches expand a bounded Italian/English
+synonym map before querying exact matches, FTS5, SQL fallback, and fuzzy ranking.
+This lets equivalent terms such as `navigatore`/`browser` and
+`copia`/`duplica` find the same stored item without calling FreeLLMAPI.
 
 When a fresh proposal is needed, Za also navigates the filesystem read-only: it
 matches file and folder names against the request and hands the real existing
@@ -87,19 +113,20 @@ Before retrying, Za tries to repair common malformations in the model output
 (unquoted keys, trailing commas, single quotes, comments) and requires `code` to
 be non-empty.
 `--find-files QUERY` performs the same name search from the command line and
-prints `path<TAB>kind<TAB>size` without loading the model.
+prints `path<TAB>kind<TAB>size` without calling FreeLLMAPI.
 
 ## Test
 
-Tests use temporary directories, simulated external commands, and never download
-or load the model:
+Tests use temporary directories and simulated external commands. They never
+contact FreeLLMAPI or read/write the real keyring:
 
 ```bash
 python3 -m py_compile za.py
 ./za.py --self-test
 ./za.py --help
+systemd-analyze --user verify freellmapi.service
 ```
 
-For optional runtime timings, use `--benchmark`; generation metrics include model
-load time, time to first token, output tokens, and tokens per second when a model
-generation has occurred in the current process.
+For optional runtime timings, use `--benchmark`; after a generation in the
+current process its metrics include request time, token usage, and the provider
+selected by the FreeLLMAPI router.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Za: a small, local, learning Linux agent."""
+"""Za: a small learning Linux agent powered by FreeLLMAPI."""
 
 import argparse
 import configparser
@@ -7,6 +7,7 @@ import contextlib
 import curses
 import dataclasses
 import difflib
+import getpass
 import hashlib
 import json
 import os
@@ -22,24 +23,14 @@ import tempfile
 import textwrap
 import threading
 import time
-import warnings
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
-# Il modello caricato ha temperature/top_p/top_k non di default, mentre la
-# generazione usa do_sample=False: transformers segnala l'incoerenza a ogni
-# chiamata. Filtriamo solo quei tre avvisi, senza cambiare le impostazioni.
-warnings.filterwarnings(
-    "ignore",
-    category=UserWarning,
-    message=r"`do_sample` is set to `False`",
-    module="transformers.generation.configuration_utils",
-)
-
-
-MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-GGUF_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
-GGUF_FILE = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+FREELLMAPI_URL = "http://127.0.0.1:3001"
+API_MODEL = "auto"
+API_MAX_TOKENS = 768
 LOGO_TEXT = (
     "",
     " ▀▀█ █▀█",
@@ -56,6 +47,19 @@ INTERPRETERS = {
     "python": ("python3", ".py"), "bash": ("bash", ".sh"),
     "fish": ("fish", ".fish"),
 }
+SYNONYM_GROUPS = (
+    ("apri", "aprire", "avvia", "avviare", "lancia", "lanciare", "open", "launch", "start"),
+    ("copia", "copiare", "duplica", "duplicare", "copy"),
+    ("elimina", "eliminare", "cancella", "cancellare", "rimuovi", "rimuovere", "delete", "remove"),
+    ("sposta", "spostare", "muovi", "muovere", "move"),
+    ("rinomina", "rinominare", "rename"),
+    ("cerca", "cercare", "trova", "trovare", "find", "search"),
+    ("browser", "navigatore"),
+    ("immagine", "immagini", "foto", "fotografia", "image", "images", "photo"),
+    ("terminale", "console", "shell", "terminal"),
+)
+SYNONYMS = {word: frozenset(group) for group in SYNONYM_GROUPS for word in group}
+SYNONYM_CANONICAL = {word: group[0] for group in SYNONYM_GROUPS for word in group}
 
 ANSI_BOLD = "\033[1m"
 ANSI_DIM = "\033[2m"
@@ -70,6 +74,36 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_RAINBOW = ("\033[38;2;255;35;35m", "\033[38;2;255;225;0m",
                 "\033[38;2;0;255;85m", "\033[38;2;0;240;255m",
                 "\033[38;2;55;115;255m", "\033[38;2;255;35;220m")
+
+
+def synonym_terms(text):
+    terms = set()
+    for word in re.findall(r"[A-Za-zÀ-ÿ0-9_]+", text.casefold(), re.UNICODE):
+        terms.update(SYNONYMS.get(word, (word,)))
+    return sorted(terms)
+
+
+def canonicalize_synonyms(text):
+    return re.sub(
+        r"[A-Za-zÀ-ÿ0-9_]+",
+        lambda match: SYNONYM_CANONICAL.get(match.group(0).casefold(), match.group(0)),
+        text,
+        flags=re.UNICODE,
+    )
+
+
+def fts_synonym_query(text):
+    groups = []
+    seen = set()
+    for word in re.findall(r"[A-Za-zÀ-ÿ0-9_]+", text.casefold(), re.UNICODE):
+        terms = tuple(sorted(SYNONYMS.get(word, (word,))))
+        if terms in seen:
+            continue
+        seen.add(terms)
+        groups.append("(" + " OR ".join(f'"{term}"' for term in terms) + ")")
+    return " ".join(groups)
+
+
 def machine_hash():
     try:
         identity = Path("/etc/machine-id").read_text(encoding="utf-8").strip()
@@ -81,11 +115,8 @@ def machine_hash():
 @dataclasses.dataclass
 class Config:
     cache_dir: Path
-    model_cache: Path
     scan_ttl: int = 3600
     timeout: int = 120
-    max_new_tokens: int = 768
-    repetition_penalty: float = 1.05
     verbose: bool = False
     appimage_dirs: tuple = ()
 
@@ -95,18 +126,12 @@ class Config:
             "ZA_CACHE_DIR",
             Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "za",
         )).expanduser()
-        model_cache = Path(os.environ.get(
-            "ZA_MODEL_CACHE",
-            Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-            / "za" / "models",
-        )).expanduser()
         configured = os.environ.get("ZA_APPIMAGE_DIRS")
         app_dirs = tuple(Path(p).expanduser() for p in configured.split(os.pathsep)) if configured else (
             Path.home() / "Applications", Path.home() / "AppImages",
             Path("/opt"), Path("/usr/local/bin"),
         )
-        return cls(base / "machines" / machine_hash(), model_cache,
-                   verbose=verbose, appimage_dirs=app_dirs)
+        return cls(base / "machines" / machine_hash(), verbose=verbose, appimage_dirs=app_dirs)
 
 
 def terminal_style(text, *codes):
@@ -128,7 +153,7 @@ def logo_lines():
 
 def terminal_header():
     return "\n".join((*logo_lines(),
-                      "Micro-agente Linux locale", terminal_style(MODEL, ANSI_DIM),
+                      "Micro-agente Linux · FreeLLMAPI", terminal_style(API_MODEL, ANSI_DIM),
                       terminal_style(str(Path.cwd()), ANSI_DIM)))
 
 
@@ -625,7 +650,7 @@ class ApplicationResolver:
     def _ranked(self, query, key, limit):
         scored, seen = [], set()
         if self.db.fts:
-            safe = " ".join(re.findall(r"[\w.-]+", key, re.UNICODE))
+            safe = fts_synonym_query(key)
             if safe:
                 try:
                     for row in self._rows("""SELECT a.* FROM applications_fts f JOIN applications a ON a.id=f.app_id
@@ -636,12 +661,18 @@ class ApplicationResolver:
                             scored.append(row)
                 except sqlite3.OperationalError:
                     pass
-        like = f"%{key}%"
-        for row in self._rows("""SELECT * FROM applications WHERE name LIKE ? OR description LIKE ?
-                                 ORDER BY uses DESC LIMIT ?""", (like, like, max(limit * 4, 20))):
-            row["score"] = self._score(row, key)
-            if row["score"] > 0:
-                scored.append(row)
+        terms = synonym_terms(key)
+        if terms:
+            clauses = " OR ".join("""name LIKE ? OR identifier LIKE ? OR description LIKE ?
+              OR EXISTS(SELECT 1 FROM aliases x WHERE x.application_id=applications.id AND x.alias LIKE ?)"""
+                                  for _ in terms)
+            parameters = [value for term in terms for value in (f"%{term}%",) * 4]
+            for row in self._rows(f"""SELECT * FROM applications WHERE {clauses}
+                                     ORDER BY uses DESC LIMIT ?""",
+                                  (*parameters, max(limit * 4, 20))):
+                row["score"] = self._score(row, key)
+                if row["score"] > 0:
+                    scored.append(row)
         unique = []
         for row in scored:
             if row["id"] in seen:
@@ -667,7 +698,7 @@ class ApplicationResolver:
         description = (row.get("description") or "").casefold()
         if name == key or identifier == key:
             return 1000
-        words = set(re.findall(r"[\w]+", key, re.UNICODE))
+        words = set(synonym_terms(key))
         name_words = set(re.findall(r"[\w]+", name, re.UNICODE))
         if name.startswith(key) or identifier.startswith(key):
             score = 700
@@ -694,7 +725,7 @@ class ApplicationResolver:
         if len(rows) > 20000:
             return []
         names = [(row["name"] or "").casefold() for row in rows]
-        matches = difflib.get_close_matches(key, names, n=limit, cutoff=0.65)
+        matches = difflib.get_close_matches(key, names, n=limit, cutoff=0.75)
         by_name = {}
         for row in rows:
             by_name.setdefault((row["name"] or "").casefold(), row)
@@ -767,7 +798,7 @@ def normalize_intent(request):
     text = re.sub(r"(?:~|/)[^\s'\"]+", "{{path}}", text)
     text = re.sub(r"['\"][^'\"]+['\"]", "{{value}}", text)
     text = re.sub(r"\b\d+\b", "{{number}}", text)
-    return " ".join(text.split())
+    return " ".join(canonicalize_synonyms(text).split())
 
 
 SENSITIVE_KEY = re.compile(r"(?i)(password|passwd|token|api[_-]?key|secret|cookie|credential)")
@@ -1102,13 +1133,13 @@ class SkillStore:
 
     def relevant_descriptions(self, request, limit=3):
         if self.db.fts:
-            safe = " ".join(re.findall(r"[\w.-]+", request.casefold(), re.UNICODE))
+            safe = fts_synonym_query(request)
             if safe:
                 with contextlib.suppress(sqlite3.OperationalError):
                     return [dict(row) for row in self.db.connection.execute("""SELECT s.* FROM skills_fts f
                       JOIN skills s ON s.id=f.skill_id WHERE skills_fts MATCH ? ORDER BY rank LIMIT ?""",
                       (safe, limit))]
-        words = [word for word in re.findall(r"[\w.-]+", request.casefold()) if len(word) > 2]
+        words = [word for word in synonym_terms(request) if len(word) > 2]
         if not words:
             return []
         clauses = " OR ".join("description LIKE ? OR name LIKE ?" for _ in words)
@@ -1143,7 +1174,7 @@ class SkillStore:
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (skill_id, version, redact_sensitive(request), intent, generated, approved, diff,
            proposal.language, json.dumps(template) if template else None, "proposed",
-           proposal.verification, MODEL, "approved", now))
+           proposal.verification, API_MODEL, "approved", now))
         self._rebuild_fts()
         self.db.connection.commit()
         return skill_id, version
@@ -1164,7 +1195,7 @@ class SkillStore:
           AND s.status IN ('verified','trusted') ORDER BY s.status='trusted' DESC,s.successes DESC LIMIT ?""",
           (intent, limit)).fetchall()
         if not rows and self.db.fts:
-            safe = " ".join(re.findall(r"[\w.-]+", intent, re.UNICODE))
+            safe = fts_synonym_query(intent)
             if safe:
                 with contextlib.suppress(sqlite3.OperationalError):
                     rows = self.db.connection.execute("""SELECT s.*,v.request,v.approved_code,v.language,
@@ -1173,7 +1204,7 @@ class SkillStore:
                       ON v.skill_id=s.id AND v.version=s.current_version WHERE skills_fts MATCH ?
                       AND s.status IN ('verified','trusted') ORDER BY rank LIMIT ?""", (safe, limit)).fetchall()
         if not rows:
-            words = [word for word in re.findall(r"[A-Za-zÀ-ÿ0-9_]+", intent, re.UNICODE) if len(word) > 2]
+            words = [word for word in synonym_terms(intent) if len(word) > 2]
             if words:
                 candidates = []
                 for row in self.db.connection.execute("""SELECT s.*,v.request,v.approved_code,v.language,
@@ -1279,97 +1310,103 @@ class SkillStore:
 
     def revoke(self, name, delete=False):
         if delete:
-            self.db.connection.execute("DELETE FROM skills WHERE name=?", (name,))
-        else:
-            self.db.connection.execute("UPDATE skills SET status='revoked',updated_at=? WHERE name=?",
-                                       (time.time(), name))
+            row = self.db.connection.execute("SELECT id FROM skills WHERE name=?", (name,)).fetchone()
+            return self.delete(row[0]) if row else False
+        self.db.connection.execute("UPDATE skills SET status='revoked',updated_at=? WHERE name=?",
+                                   (time.time(), name))
         self._rebuild_fts()
         self.db.connection.commit()
 
+    def delete(self, skill_id):
+        if not self.db.connection.execute("SELECT 1 FROM skills WHERE id=?", (skill_id,)).fetchone():
+            return False
+        self.db.connection.execute("UPDATE executions SET skill_id=NULL WHERE skill_id=?", (skill_id,))
+        self.db.connection.execute("DELETE FROM skills WHERE id=?", (skill_id,))
+        self._rebuild_fts()
+        self.db.connection.commit()
+        return True
 
-class ModelEngine:
+
+def read_api_key():
+    try:
+        result = subprocess.run(
+            ["secret-tool", "lookup", "application", "freellmapi", "account", "default"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("secret-tool non è installato: impossibile accedere al portachiavi.") from error
+    key = result.stdout.strip()
+    return key if result.returncode == 0 and key else None
+
+
+def load_api_key():
+    key = read_api_key()
+    if key:
+        return key
+    key = getpass.getpass("FreeLLMAPI unified API key: ").strip()
+    if not key:
+        raise RuntimeError("La API key non può essere vuota.")
+    result = subprocess.run(
+        ["secret-tool", "store", "--label=FreeLLMAPI unified API key",
+         "application", "freellmapi", "account", "default"],
+        input=key, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Impossibile salvare la API key nel portachiavi.")
+    return key
+
+
+class FreeLLMAPIEngine:
     def __init__(self, config):
-        self.config, self.tokenizer, self.model = config, None, None
-        self.load_seconds = None
+        self.config = config
+        self.api_key = None
         self.last_metrics = {}
 
-    def cache_present(self):
-        snapshots = self.config.model_cache / f"models--{MODEL.replace('/', '--')}" / "snapshots"
-        if not snapshots.exists():
-            return False
-        for snapshot in snapshots.iterdir():
-            has_weights = ((snapshot / "model.safetensors").exists()
-                           or (snapshot / "model.safetensors.index.json").exists())
-            if (snapshot / "config.json").exists() and has_weights:
-                return True
-        return False
-
-    def load(self):
-        if self.model is not None:
-            return self.tokenizer, self.model
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        cached = self.cache_present()
-        if not cached:
-            print(terminal_style("╭──────────────────────╮", ANSI_MAGENTA))
-            print(terminal_style("│ ↓  MODEL DOWNLOAD  ↓ │", ANSI_YELLOW))
-            print(terminal_style("╰──────────────────────╯", ANSI_BLUE))
-            show_status("◆", f"Scarico {MODEL}…", ANSI_GREEN)
-            show_status("→", str(self.config.model_cache), ANSI_CYAN)
-        started = time.monotonic()
-        self.config.model_cache.mkdir(parents=True, exist_ok=True)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            MODEL, cache_dir=self.config.model_cache, local_files_only=cached)
-        kwargs = dict(cache_dir=self.config.model_cache, device_map="auto", low_cpu_mem_usage=True,
-                      torch_dtype=torch.float16 if torch.cuda.is_available() else torch.bfloat16,
-                      local_files_only=cached)
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(MODEL, attn_implementation="sdpa", **kwargs)
-        except (TypeError, ValueError, RuntimeError):
-            self.model = AutoModelForCausalLM.from_pretrained(MODEL, **kwargs)
-        self.model.eval()
-        self.load_seconds = time.monotonic() - started
-        return self.tokenizer, self.model
-
     def generate(self, messages):
-        import torch
-        from transformers import TextIteratorStreamer
-        tokenizer, model = self.load()
-        inputs = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt",
-            return_dict=True, tokenize=True)
-        if hasattr(inputs, "to"):
-            inputs = inputs.to(model.device)
-        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-        errors, chunks = [], []
-        started, first_token = time.monotonic(), [None]
-
-        def work():
-            try:
-                with torch.inference_mode():
-                    model.generate(**inputs, streamer=streamer,
-                                   max_new_tokens=self.config.max_new_tokens,
-                                   do_sample=False, repetition_penalty=self.config.repetition_penalty,
-                                   use_cache=True, pad_token_id=tokenizer.eos_token_id)
-            except Exception as error:
-                errors.append(error)
-                streamer.end()
-
-        worker = threading.Thread(target=work)
-        worker.start()
-        for chunk in streamer:
-            if first_token[0] is None:
-                first_token[0] = time.monotonic()
-            chunks.append(chunk)
-        worker.join()
-        if errors:
-            raise errors[0]
+        if self.api_key is None:
+            self.api_key = load_api_key()
+        body = json.dumps({
+            "model": API_MODEL,
+            "messages": messages,
+            "max_tokens": API_MAX_TOKENS,
+            "response_format": {"type": "json_object"},
+        }, ensure_ascii=False).encode()
+        request = urllib.request.Request(
+            f"{FREELLMAPI_URL}/v1/chat/completions",
+            data=body,
+            headers={"Authorization": f"Bearer {self.api_key}",
+                     "Content-Type": "application/json"},
+            method="POST",
+        )
+        started = time.monotonic()
+        try:
+            with urllib.request.urlopen(request, timeout=self.config.timeout) as response:
+                payload = json.loads(response.read())
+                routed_via = response.headers.get("x-routed-via")
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"FreeLLMAPI ha risposto HTTP {error.code}: {detail}") from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"FreeLLMAPI non raggiungibile su {FREELLMAPI_URL}: {error.reason}") from error
+        try:
+            content = payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise RuntimeError("Risposta FreeLLMAPI priva del contenuto atteso.") from error
+        if not isinstance(content, str):
+            raise RuntimeError("FreeLLMAPI ha restituito un contenuto non testuale.")
         elapsed = time.monotonic() - started
-        tokens = len(tokenizer.encode("".join(chunks), add_special_tokens=False))
-        self.last_metrics = {"generation_seconds": elapsed, "first_token_seconds":
-                             (first_token[0] - started if first_token[0] else None),
-                             "tokens": tokens, "tokens_per_second": tokens / elapsed if elapsed else 0}
-        return "".join(chunks)
+        usage = payload.get("usage") or {}
+        self.last_metrics = {
+            "generation_seconds": elapsed,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "tokens": usage.get("completion_tokens"),
+            "routed_via": routed_via,
+        }
+        return content
+
+
+def default_engine(config):
+    return FreeLLMAPIEngine(config)
 
 
 def repair_json(text):
@@ -1406,76 +1443,6 @@ def _proposal_from_dict(value):
     return CodeProposal(str(value.get("explanation", "Proposta generata.")), language,
                         code.strip(), str(value.get("verification", "exit-code")),
                         str(value.get("risk", "normal")), generated_code=code.strip())
-
-
-JSON_GRAMMAR = r"""root ::= object
-value ::= object | array | string | number | ("true" | "false" | "null") ws
-object ::= "{" ws ( string ":" ws value ("," ws string ":" ws value)* )? "}" ws
-array ::= "[" ws ( value ("," ws value)* )? "]" ws
-string ::= "\"" ( [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) )* "\"" ws
-number ::= ("-" | "+")? ("0" | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
-ws ::= [ \t\n]*
-"""
-
-
-class LlamaModelEngine:
-    """Backend llama-cpp-python: stessa interfaccia di ModelEngine, JSON garantito dalla grammar."""
-
-    def __init__(self, config):
-        self.config = config
-        self.llm = None
-        self.load_seconds = None
-        self.last_metrics = {}
-
-    def _gguf_path(self):
-        from huggingface_hub import try_to_load_from_cache
-        cached = try_to_load_from_cache(GGUF_MODEL, GGUF_FILE, cache_dir=self.config.model_cache)
-        return Path(cached) if cached else self.config.model_cache / GGUF_FILE
-
-    def cache_present(self):
-        return self._gguf_path().exists()
-
-    def load(self):
-        if self.llm is not None:
-            return self.llm
-        from llama_cpp import Llama, LlamaGrammar
-        path = self._gguf_path()
-        if not path.exists():
-            print(terminal_style("╭──────────────────────╮", ANSI_MAGENTA))
-            print(terminal_style("│ ↓  MODEL DOWNLOAD  ↓ │", ANSI_YELLOW))
-            print(terminal_style("╰──────────────────────╯", ANSI_BLUE))
-            show_status("◆", f"Scarico {GGUF_FILE}…", ANSI_GREEN)
-            show_status("→", str(self.config.model_cache), ANSI_CYAN)
-            from huggingface_hub import hf_hub_download
-            path = Path(hf_hub_download(GGUF_MODEL, GGUF_FILE, cache_dir=self.config.model_cache))
-        started = time.monotonic()
-        self.llm = Llama(model_path=str(path), n_ctx=4096, n_batch=512, verbose=False)
-        self.load_seconds = time.monotonic() - started
-        self.grammar = LlamaGrammar.from_string(JSON_GRAMMAR, verbose=False)
-        return self.llm
-
-    def generate(self, messages):
-        llm = self.load()
-        started = time.monotonic()
-        response = llm.create_chat_completion(
-            messages=messages, max_tokens=self.config.max_new_tokens,
-            temperature=0.2, repeat_penalty=self.config.repetition_penalty,
-            grammar=self.grammar)
-        elapsed = time.monotonic() - started
-        text = response["choices"][0]["message"]["content"]
-        tokens = response["usage"]["completion_tokens"]
-        self.last_metrics = {"generation_seconds": elapsed, "first_token_seconds": None,
-                             "prompt_tokens": response["usage"]["prompt_tokens"],
-                             "tokens": tokens, "tokens_per_second": tokens / elapsed if elapsed else 0}
-        return text
-
-
-def default_engine(config):
-    try:
-        import llama_cpp  # noqa: F401
-    except ImportError:
-        return ModelEngine(config)
-    return LlamaModelEngine(config)
 
 
 def parse_model_output(text):
@@ -1760,7 +1727,7 @@ Il codice deve essere ripetibile, usare argv/subprocess senza shell quando possi
           (skill_id, version, redact_sensitive(request), normalize_intent(request),
            redact_sensitive(proposal.generated_code), redact_sensitive(approved_code),
            json.dumps({"paths": request_paths(request)}, ensure_ascii=False),
-           None, "", "", 0, "process-started", MODEL, time.time()))
+           None, "", "", 0, "process-started", API_MODEL, time.time()))
         self.db.connection.commit()
         return process, cursor.lastrowid, skill_id, version
 
@@ -2037,48 +2004,6 @@ def feedback_action(answer):
     return None
 
 
-# Compatibility helpers retained for callers of the original single-file API.
-_COMPAT_ENGINE = None
-
-
-def load_model():
-    global _COMPAT_ENGINE
-    if _COMPAT_ENGINE is None:
-        _COMPAT_ENGINE = ModelEngine(Config.create())
-    return _COMPAT_ENGINE.load()
-
-
-def generate_stream(tokenizer, model, inputs):
-    import torch
-    from transformers import TextIteratorStreamer
-    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-    errors, chunks = [], []
-
-    def work():
-        try:
-            with torch.inference_mode():
-                model.generate(**inputs, streamer=streamer, max_new_tokens=768,
-                               do_sample=False, repetition_penalty=1.05, use_cache=True,
-                               pad_token_id=tokenizer.eos_token_id)
-        except Exception as error:
-            errors.append(error); streamer.end()
-    worker = threading.Thread(target=work); worker.start()
-    for chunk in streamer:
-        chunks.append(chunk)
-    worker.join()
-    if errors:
-        raise errors[0]
-    return "".join(chunks)
-
-
-def ask_model(prompt):
-    tokenizer, model = load_model()
-    inputs = tokenizer(prompt, return_tensors="pt")
-    if hasattr(inputs, "to"):
-        inputs = inputs.to(model.device)
-    return generate_stream(tokenizer, model, inputs)
-
-
 def run_code(language, code):
     return Executor().run(CodeProposal("", language, code))
 
@@ -2209,18 +2134,27 @@ def interactive(agent):
             show_status("→", "Ti mostro il codice prima dell’esecuzione.", ANSI_CYAN)
             show_code(proposal)
             high_risk = Executor.risk(proposal.code) == "high" or proposal.risk == "high"
-            prompt = ("\nRISCHIO ELEVATO — digita 'approve' per eseguire · e modifica · n annulla: "
-                      if high_risk else "\n[Invio] esegui · e modifica · n annulla: ")
+            saved_skill = proposal.source == "skill" and proposal.skill_id is not None
+            delete_hint = " · d elimina procedura" if saved_skill else ""
+            prompt = (f"\nRISCHIO ELEVATO — digita 'approve' per eseguire · e modifica"
+                      f"{delete_hint} · n annulla: " if high_risk else
+                      f"\n[Invio] esegui · e modifica{delete_hint} · n annulla: ")
             try:
                 answer = input(prompt)
             except (EOFError, KeyboardInterrupt):
                 print()
                 answer = "n"
-            if high_risk:
+            if saved_skill and answer.strip().casefold() == "d":
+                action = "delete"
+            elif high_risk:
                 action = "execute" if answer.strip().casefold() == "approve" else (
                     "edit" if answer.strip().casefold() == "e" else "cancel" if answer.strip().casefold() == "n" else "invalid")
             else:
                 action = confirmation_action(answer)
+            if action == "delete":
+                agent.skills.delete(proposal.skill_id)
+                show_status("✓", "Procedura eliminata dal database; nulla è stato eseguito.", ANSI_GREEN)
+                break
             if action == "edit":
                 proposal.code = edit_code(proposal.language, proposal.code)
                 continue
@@ -2250,15 +2184,13 @@ def interactive(agent):
 def run_self_tests():
     import builtins
     import unittest
-    import types
     from unittest.mock import Mock, patch
 
     class Tests(unittest.TestCase):
         def setUp(self):
             self.temp = tempfile.TemporaryDirectory()
             self.root = Path(self.temp.name)
-            self.config = Config(self.root / "machine", self.root / "models",
-                                 appimage_dirs=(self.root / "apps",))
+            self.config = Config(self.root / "machine", appimage_dirs=(self.root / "apps",))
             self.db = SystemDatabase(self.config.cache_dir / "system.sqlite")
 
         def tearDown(self):
@@ -2336,6 +2268,17 @@ def run_self_tests():
                 interactive(agent)
             agent.execute_approved.assert_not_called()
 
+        def test_09b_wrong_reused_skill_can_be_deleted_from_prompt(self):
+            agent = Mock()
+            agent.scanner.scan.return_value = {"cached": True, "seconds": 0}
+            agent.propose.return_value = (
+                CodeProposal("errata", "bash", "false", source="skill", skill_id=42), {})
+            with patch("builtins.input", side_effect=["usa procedura", "d", "quit"]), \
+                 patch("sys.stdout", new=Mock(isatty=Mock(return_value=False))):
+                interactive(agent)
+            agent.skills.delete.assert_called_once_with(42)
+            agent.execute_approved.assert_not_called()
+
         def test_10_redaction(self):
             self.assertNotIn("abcd1234", redact_sensitive("token=abcd1234 x", {"API_KEY":"abcd1234"}))
             self.assertIn("<redacted>", redact_sensitive("password=hunter2", {}))
@@ -2345,33 +2288,34 @@ def run_self_tests():
             self.assertEqual(proposal.code, "echo hi")
             self.assertIsNone(parse_model_output("run echo hi"))
 
-        def test_12_offline_cache_detection(self):
-            snapshots = self.config.model_cache / f"models--{MODEL.replace('/', '--')}" / "snapshots" / "abc"
-            snapshots.mkdir(parents=True)
-            (snapshots / "config.json").write_text("{}")
-            (snapshots / "model.safetensors").write_bytes(b"weights")
-            self.assertTrue(ModelEngine(self.config).cache_present())
+        def test_12_missing_api_key_is_saved_in_keyring(self):
+            missing = subprocess.CompletedProcess([], 1, "", "")
+            stored = subprocess.CompletedProcess([], 0, "", "")
+            with patch("subprocess.run", side_effect=[missing, stored]) as run, \
+                 patch("getpass.getpass", return_value="freellmapi-test-key"):
+                self.assertEqual(load_api_key(), "freellmapi-test-key")
+            self.assertEqual(run.call_args_list[1].kwargs["input"], "freellmapi-test-key")
+            self.assertNotIn("freellmapi-test-key", run.call_args_list[1].args[0])
 
-        def test_12b_model_output_is_not_shown(self):
+        def test_12b_freellmapi_engine_uses_keyring_and_chat_api(self):
             raw = '{"explanation":"internal","language":"bash","code":"true"}'
-
-            class Streamer:
-                def __init__(self, *args, **kwargs): pass
-                def __iter__(self): return iter([raw])
-                def end(self): pass
-
-            tokenizer = Mock()
-            tokenizer.apply_chat_template.return_value = {}
-            tokenizer.encode.return_value = [1]
-            model = Mock(device="cpu")
-            engine = ModelEngine(self.config)
-            engine.load = Mock(return_value=(tokenizer, model))
-            fake_torch = types.SimpleNamespace(inference_mode=Mock(return_value=contextlib.nullcontext()))
-            fake_transformers = types.SimpleNamespace(TextIteratorStreamer=Streamer)
-            with patch.dict(sys.modules, {"torch": fake_torch, "transformers": fake_transformers}), \
-                 patch("sys.stdout.isatty", return_value=True), patch("builtins.print") as output:
-                self.assertEqual(engine.generate([]), raw)
-            self.assertNotIn(raw, "".join(str(call) for call in output.call_args_list))
+            response = Mock()
+            response.read.return_value = json.dumps({
+                "choices": [{"message": {"content": raw}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 5},
+            }).encode()
+            response.headers = {"x-routed-via": "test-provider"}
+            engine = FreeLLMAPIEngine(self.config)
+            with patch(f"{__name__}.load_api_key", return_value="freellmapi-test-key"), \
+                 patch("urllib.request.urlopen",
+                       return_value=contextlib.nullcontext(response)) as urlopen:
+                self.assertEqual(engine.generate([{"role": "user", "content": "test"}]), raw)
+            request = urlopen.call_args.args[0]
+            payload = json.loads(request.data)
+            self.assertEqual(request.full_url, "http://127.0.0.1:3001/v1/chat/completions")
+            self.assertEqual(request.get_header("Authorization"), "Bearer freellmapi-test-key")
+            self.assertEqual(payload["model"], "auto")
+            self.assertEqual(payload["response_format"], {"type": "json_object"})
 
         def test_12c_stderr_is_shown_only_on_failure(self):
             result = subprocess.CompletedProcess([], 0, "", "minor warning\n")
@@ -2411,24 +2355,15 @@ def run_self_tests():
             reused = store.proposal_from_skill("copy /e /f", skills[0])
             self.assertEqual(reused.code, "cp /e /f")
 
-        def test_16_cached_model_load_is_forced_offline(self):
-            snapshots = self.config.model_cache / f"models--{MODEL.replace('/', '--')}" / "snapshots" / "abc"
-            snapshots.mkdir(parents=True, exist_ok=True)
-            (snapshots / "config.json").write_text("{}")
-            (snapshots / "model.safetensors").write_bytes(b"weights")
-            tokenizer_loader, model_loader = Mock(), Mock()
-            tokenizer_loader.from_pretrained.return_value = Mock()
-            loaded_model = Mock(); model_loader.from_pretrained.return_value = loaded_model
-            fake_torch = types.SimpleNamespace(
-                cuda=types.SimpleNamespace(is_available=lambda: False),
-                float16="float16", bfloat16="bfloat16")
-            fake_transformers = types.SimpleNamespace(
-                AutoTokenizer=tokenizer_loader, AutoModelForCausalLM=model_loader)
-            with patch.dict(sys.modules, {"torch": fake_torch, "transformers": fake_transformers}):
-                ModelEngine(self.config).load()
-            self.assertTrue(tokenizer_loader.from_pretrained.call_args.kwargs["local_files_only"])
-            self.assertTrue(model_loader.from_pretrained.call_args.kwargs["local_files_only"])
-            loaded_model.eval.assert_called_once_with()
+        def test_16_application_search_uses_synonyms(self):
+            self.db.upsert_application({"source": "native", "identifier": "browser",
+                                        "name": "Web Browser", "description": "Browse the web",
+                                        "launch": ["browser"]})
+            self.db.connection.commit(); self.db.rebuild_application_fts()
+            resolver = ApplicationResolver(self.db)
+            self.assertEqual(resolver.search("navigatore")[0]["identifier"], "browser")
+            self.db.fts = False
+            self.assertEqual(resolver.search("navigatore")[0]["identifier"], "browser")
 
         def test_17_version_one_schema_is_migrated(self):
             path = self.root / "old.sqlite"
@@ -2505,12 +2440,31 @@ def run_self_tests():
             self.assertTrue(any(color in "".join(colored) for color in ANSI_RAINBOW))
             self.assertNotEqual(colored, plain)
 
-        def test_22_partial_model_cache_is_resumed_online(self):
-            snapshot = (self.config.model_cache
-                        / f"models--{MODEL.replace('/', '--')}" / "snapshots" / "partial")
-            snapshot.mkdir(parents=True)
-            (snapshot / "config.json").write_text("{}")
-            self.assertFalse(ModelEngine(self.config).cache_present())
+        def test_22_skill_search_normalizes_synonyms(self):
+            store = SkillStore(self.db)
+            proposal = CodeProposal("copia", "bash", "cp a b", generated_code="cp a b")
+            skill_id, version = store.create_candidate("copia file", proposal, proposal.code)
+            store.record_outcome(skill_id, version, True)
+            skills, _ = store.retrieve("duplica file")
+            self.assertEqual(skills[0]["id"], skill_id)
+            self.assertIsNotNone(store.proposal_from_skill("duplica file", skills[0]))
+
+        def test_22b_delete_skill_keeps_execution_history(self):
+            store = SkillStore(self.db)
+            proposal = CodeProposal("errata", "bash", "false", generated_code="false")
+            skill_id, version = store.create_candidate("procedura errata", proposal, proposal.code)
+            proposal.skill_id, proposal.skill_version = skill_id, version
+            agent = ZaAgent(self.config, database=self.db, engine=Mock())
+            agent.executor.start = Mock(return_value=Mock(pid=1))
+            _, execution_id, _, _ = agent.execute_approved(
+                "procedura errata", proposal, proposal.code)
+            self.assertTrue(store.delete(skill_id))
+            self.assertIsNone(self.db.connection.execute(
+                "SELECT 1 FROM skills WHERE id=?", (skill_id,)).fetchone())
+            self.assertEqual(store.db.connection.execute(
+                "SELECT count(*) FROM skill_versions WHERE skill_id=?", (skill_id,)).fetchone()[0], 0)
+            self.assertIsNone(self.db.connection.execute(
+                "SELECT skill_id FROM executions WHERE id=?", (execution_id,)).fetchone()[0])
 
         def test_23_link_apps_creates_symlinks_without_overwriting(self):
             app = self.root / "Editor.AppImage"
@@ -2736,6 +2690,14 @@ def run_self_tests():
             self.assertEqual(resolver.search("image")[0]["identifier"], "paint")
             self.assertEqual(resolver.search("pint")[0]["identifier"], "paint")
 
+        def test_40b_fuzzy_search_rejects_unrelated_application(self):
+            self.db.upsert_application({"source": "native", "identifier": "pnminvert",
+                                        "name": "pnminvert", "description": "image converter",
+                                        "launch": ["pnminvert"]})
+            self.db.connection.commit(); self.db.rebuild_application_fts()
+            with patch("shutil.which", return_value=None):
+                self.assertEqual(ApplicationResolver(self.db).search("minecraft"), [])
+
         def test_41_search_falls_back_to_path(self):
             with patch("shutil.which", return_value="/usr/bin/gimp"):
                 rows = ApplicationResolver(self.db).search("gimp")
@@ -2940,10 +2902,8 @@ def run_self_tests():
                 '{"explanation":"x","language":"bash","code":"  "}'))
             self.assertIsNone(parse_model_output("parole senza struttura"))
 
-        def test_60_engine_dispatch_falls_back_without_llama_cpp(self):
-            with patch.dict("sys.modules", {"llama_cpp": None}):
-                self.assertIsInstance(default_engine(self.config), ModelEngine)
-            self.assertIsInstance(default_engine(self.config), LlamaModelEngine)
+        def test_60_default_engine_is_freellmapi(self):
+            self.assertIsInstance(default_engine(self.config), FreeLLMAPIEngine)
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
     return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
@@ -2960,7 +2920,7 @@ def build_parser():
     actions.add_argument("--list-apps", action="store_true", help="elenca le applicazioni trovate")
     actions.add_argument("--find-app", metavar="QUERY", help="cerca un'applicazione")
     actions.add_argument("--find-files", metavar="QUERY",
-                         help="cerca file e cartelle per nome (senza caricare il modello)")
+                         help="cerca file e cartelle per nome (senza chiamare FreeLLMAPI)")
     actions.add_argument("--list-skills", action="store_true", help="elenca le procedure apprese")
     actions.add_argument("--skill", metavar="NAME", help="mostra una procedura")
     actions.add_argument("--revoke-skill", metavar="NAME", help="revoca una procedura")
@@ -3002,24 +2962,25 @@ def command_line(agent, args):
         row = agent.skills.get(args.delete_skill)
         if not row or row["status"] != "revoked":
             raise SystemExit("La skill deve esistere ed essere revocata prima dell'eliminazione.")
-        agent.skills.revoke(args.delete_skill, delete=True); print("Skill eliminata."); return
+        agent.skills.delete(row["id"]); print("Skill eliminata."); return
     if args.rebuild_cache:
         agent.db.rebuild_regenerable(); print(json.dumps(agent.scanner.scan(force=True), indent=2)); return
     if args.diagnose:
-        import torch
+        try:
+            api_key_present = bool(read_api_key())
+        except RuntimeError:
+            api_key_present = False
         print(json.dumps({"machine_cache": str(agent.config.cache_dir), "database": str(agent.db.path),
                           "database_recovered": str(agent.db.recovered_path or ""), "fts5": agent.db.fts,
-                          "backend": type(agent.engine).__name__, "model": MODEL,
-                          "model_cached": agent.engine.cache_present(),
-                          "cuda": torch.cuda.is_available(), "device":
-                          torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
-                          "dtype": "float16" if torch.cuda.is_available() else "bfloat16",
+                          "backend": type(agent.engine).__name__, "model": API_MODEL,
+                          "freellmapi_url": FREELLMAPI_URL,
+                          "api_key_in_keyring": api_key_present,
                           "flatpak": bool(shutil.which("flatpak")), "gtk_launch": bool(shutil.which("gtk-launch"))},
                          indent=2)); return
     if args.benchmark:
         started = time.monotonic(); scan = agent.scanner.scan(); search = agent.skills.retrieve("benchmark")
         print(json.dumps({"scanner_seconds": scan["seconds"], "scanner_cached": scan["cached"],
-                          "skill_search_seconds": search[1], "model_load_seconds": agent.engine.load_seconds,
+                          "skill_search_seconds": search[1],
                           **agent.engine.last_metrics}, indent=2)); return
     interactive(agent)
 

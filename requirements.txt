@@ -1,4 +1,1 @@
-accelerate>=0.33
-torch>=2.4
-transformers>=4.46,<5
-llama-cpp-python>=0.3
+# Nessuna dipendenza Python esterna.
