@@ -9,8 +9,12 @@ local-model backend and downloads no model weights.
 Za inventories installed applications, retrieves machine-compatible procedures,
 and asks the model only when deterministic resolution is insufficient. Every
 proposed Python, Bash, or Fish script is shown before execution and can be edited
-or cancelled. Pressing Enter approves normal-risk code; elevated-risk operations
-require typing `approve`.
+or cancelled while its rating is below 10. The displayed rating starts at 0 for
+new AI code and counts confirmed successful executions. After 10 successes,
+unchanged stored code runs automatically without execution approval or result
+confirmation, including elevated-risk code. Editing code starts a new version
+with rating 0. Below the threshold, Enter approves normal-risk code and
+elevated-risk operations require typing `approve`.
 
 When the proposal comes from a stored procedure, the approval prompt also shows
 `d elimina procedura`. Pressing `d` deletes that procedure and all its versions

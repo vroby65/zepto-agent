@@ -39,6 +39,7 @@ LOGO_TEXT = (
 )
 SCHEMA_VERSION = 3
 OUTPUT_LIMIT = 64 * 1024
+FEEDBACK_SKIP_SUCCESSES = 10
 LANGUAGE_ALIASES = {
     "python": "python", "python3": "python", "bash": "bash",
     "sh": "bash", "shell": "bash", "fish": "fish",
@@ -1157,7 +1158,7 @@ class SkillStore:
         row = self.db.connection.execute("SELECT id,current_version FROM skills WHERE name=?", (name,)).fetchone()
         if row:
             skill_id, version = row[0], row[1] + 1
-            self.db.connection.execute("UPDATE skills SET current_version=?,status='approved',updated_at=? WHERE id=?",
+            self.db.connection.execute("UPDATE skills SET current_version=?,status='approved',successes=0,failures=0,updated_at=? WHERE id=?",
                                        (version, now, skill_id))
         else:
             cursor = self.db.connection.execute("""INSERT INTO skills
@@ -1301,6 +1302,27 @@ class SkillStore:
             else:
                 self.db.connection.execute("UPDATE skills SET status='failed' WHERE id=?", (skill_id,))
         self.db.connection.commit()
+
+    def proposal_rating(self, proposal):
+        if proposal.source != "skill" or not proposal.skill_id:
+            return 0
+        row = self.db.connection.execute("""
+          SELECT s.successes,v.approved_code FROM skills s JOIN skill_versions v
+          ON v.skill_id=s.id AND v.version=s.current_version
+          WHERE s.id=? AND v.version=? AND s.status IN ('verified','trusted')
+          AND v.status IN ('verified','trusted')""",
+          (proposal.skill_id, proposal.skill_version)).fetchone()
+        if not row or proposal.code != row["approved_code"]:
+            return 0
+        return row["successes"]
+
+    def no_feedback_needed(self, skill_id):
+        """Skip feedback after at least FEEDBACK_SKIP_SUCCESSES positive outcomes."""
+        if not skill_id:
+            return False
+        row = self.db.connection.execute(
+            "SELECT successes FROM skills WHERE id=?", (skill_id,)).fetchone()
+        return bool(row) and row["successes"] >= FEEDBACK_SKIP_SUCCESSES
 
     def list(self):
         return self.db.connection.execute("SELECT * FROM skills ORDER BY updated_at DESC").fetchall()
@@ -2133,17 +2155,23 @@ def interactive(agent):
         while True:
             show_status("→", "Ti mostro il codice prima dell’esecuzione.", ANSI_CYAN)
             show_code(proposal)
+            rating = agent.skills.proposal_rating(proposal)
+            show_status("★", f"Voto: {rating} · esecuzioni confermate riuscite", ANSI_CYAN)
             high_risk = Executor.risk(proposal.code) == "high" or proposal.risk == "high"
             saved_skill = proposal.source == "skill" and proposal.skill_id is not None
             delete_hint = " · d elimina procedura" if saved_skill else ""
             prompt = (f"\nRISCHIO ELEVATO — digita 'approve' per eseguire · e modifica"
                       f"{delete_hint} · n annulla: " if high_risk else
                       f"\n[Invio] esegui · e modifica{delete_hint} · n annulla: ")
-            try:
-                answer = input(prompt)
-            except (EOFError, KeyboardInterrupt):
-                print()
-                answer = "n"
+            if rating >= FEEDBACK_SKIP_SUCCESSES:
+                show_status("✓", "Voto almeno 10: esecuzione automatica.", ANSI_GREEN)
+                answer = "approve" if high_risk else ""
+            else:
+                try:
+                    answer = input(prompt)
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    answer = "n"
             if saved_skill and answer.strip().casefold() == "d":
                 action = "delete"
             elif high_risk:
@@ -2168,6 +2196,9 @@ def interactive(agent):
             process, execution_id, skill_id, version = agent.execute_approved(
                 request, proposal, proposal.code)
             show_status("✓", f"Script avviato in background (&), PID {process.pid}.", ANSI_GREEN)
+            if agent.skills.no_feedback_needed(skill_id):
+                show_status("✓", "Procedura già confermata: feedback non richiesto.", ANSI_GREEN)
+                break
             success = output_feedback(process)
             if success is None:
                 show_status("!", "Feedback non registrato.", ANSI_YELLOW)
@@ -2182,6 +2213,7 @@ def interactive(agent):
 
 
 def run_self_tests():
+    import io
     import builtins
     import unittest
     from unittest.mock import Mock, patch
@@ -2261,6 +2293,7 @@ def run_self_tests():
 
         def test_09_no_execution_without_explicit_call(self):
             agent = Mock()
+            agent.skills.proposal_rating.return_value = 0
             agent.scanner.scan.return_value = {"cached": True, "seconds": 0}
             agent.propose.return_value = (CodeProposal("proposal", "bash", "echo safe"), {})
             with patch("builtins.input", side_effect=["do it", "n", "quit"]), \
@@ -2270,6 +2303,7 @@ def run_self_tests():
 
         def test_09b_wrong_reused_skill_can_be_deleted_from_prompt(self):
             agent = Mock()
+            agent.skills.proposal_rating.return_value = 0
             agent.scanner.scan.return_value = {"cached": True, "seconds": 0}
             agent.propose.return_value = (
                 CodeProposal("errata", "bash", "false", source="skill", skill_id=42), {})
@@ -2517,6 +2551,7 @@ def run_self_tests():
 
         def test_26_interactive_records_immediate_feedback(self):
             agent = Mock()
+            agent.skills.proposal_rating.return_value = 0
             agent.scanner.scan.return_value = {"cached": True, "seconds": 0}
             agent.propose.return_value = (CodeProposal("proposal", "bash", "sleep 10"), {})
             process = Mock(pid=1234)
@@ -2524,6 +2559,7 @@ def run_self_tests():
             process._za_stderr = "standard error"
             process.poll.return_value = None
             agent.execute_approved.return_value = (process, 7, 8, 9)
+            agent.skills.no_feedback_needed.return_value = False
             output = Mock(isatty=Mock(return_value=False))
             with patch("builtins.input", side_effect=["do it", "", "quit"]), \
                  patch("sys.stdout", new=output), \
@@ -2531,6 +2567,67 @@ def run_self_tests():
                 interactive(agent)
             feedback.assert_called_once_with(process)
             agent.record_feedback.assert_called_once_with(7, 8, 9, True, None)
+
+        def test_26b_feedback_skipped_after_ten_successes(self):
+            store = SkillStore(self.db)
+            proposal = CodeProposal("test", "bash", "echo ok", generated_code="echo ok")
+            skill_id, version = store.create_candidate("test command", proposal, proposal.code)
+            for _ in range(9):
+                store.record_outcome(skill_id, version, True)
+            self.assertFalse(store.no_feedback_needed(skill_id))
+            store.record_outcome(skill_id, version, True)
+            self.assertTrue(store.no_feedback_needed(skill_id))
+            self.assertFalse(store.no_feedback_needed(None))
+            self.assertFalse(store.no_feedback_needed(9999))
+
+        def test_26c_confirmed_procedure_skips_feedback_prompt(self):
+            agent = Mock()
+            agent.skills.proposal_rating.return_value = 0
+            agent.scanner.scan.return_value = {"cached": True, "seconds": 0}
+            agent.propose.return_value = (CodeProposal("proposal", "bash", "sleep 10"), {})
+            agent.execute_approved.return_value = (Mock(pid=1234), 7, 8, 9)
+            agent.skills.no_feedback_needed.return_value = True
+            output = Mock(isatty=Mock(return_value=False))
+            with patch("builtins.input", side_effect=["do it", "", "quit"]), \
+                 patch("sys.stdout", new=output), \
+                 patch(__name__ + ".output_feedback") as feedback:
+                interactive(agent)
+            feedback.assert_not_called()
+            agent.record_feedback.assert_not_called()
+
+        def test_26d_proposal_rating_tracks_unchanged_code(self):
+            store = SkillStore(self.db)
+            proposal = CodeProposal("test", "bash", "echo ok", generated_code="echo ok")
+            self.assertEqual(store.proposal_rating(proposal), 0)
+            skill_id, version = store.create_candidate("test command", proposal, proposal.code)
+            proposal.source = "skill"
+            proposal.skill_id, proposal.skill_version = skill_id, version
+            for _ in range(10):
+                store.record_outcome(skill_id, version, True)
+            self.assertEqual(store.proposal_rating(proposal), 10)
+            proposal.code = "echo changed"
+            self.assertEqual(store.proposal_rating(proposal), 0)
+            store.create_candidate("test command", proposal, proposal.code)
+            self.assertFalse(store.no_feedback_needed(skill_id))
+
+        def test_26e_ten_successes_skip_both_prompts(self):
+            agent = Mock()
+            agent.skills.proposal_rating.return_value = 0
+            agent.scanner.scan.return_value = {"cached": True, "seconds": 0}
+            agent.propose.return_value = (CodeProposal(
+                "proposal", "bash", "echo ok", source="skill",
+                skill_id=8, skill_version=9, generated_code="echo ok"), {})
+            agent.skills.proposal_rating.return_value = 10
+            agent.skills.no_feedback_needed.return_value = True
+            agent.execute_approved.return_value = (Mock(pid=1234), 7, 8, 9)
+            with patch("builtins.input", side_effect=["do it", "quit"]) as ask, \
+                 patch("sys.stdout", new=io.StringIO()) as output, \
+                 patch(__name__ + ".output_feedback") as feedback:
+                interactive(agent)
+            self.assertEqual(ask.call_count, 2)
+            self.assertIn("Voto: 10", output.getvalue())
+            agent.execute_approved.assert_called_once()
+            feedback.assert_not_called()
 
         def test_27_stderr_panel_is_red_in_a_terminal(self):
             process = Mock(_za_stdout="", _za_stderr="failure")
